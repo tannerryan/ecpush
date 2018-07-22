@@ -56,7 +56,7 @@ client.Close()
 
 
 ## Examples
-Two fully functioning clients can be found in the example directory. `client_notify.go` only returns event notifications (without fetching the event contents). `client_content.go` returns events with the corresponding contents. Note that this feature is enabled/disabled by modifying the `NotifyOnly` flag in the Client struct.
+A fully functioning client can be found in the example directory.
 
 
 ## Acknowledgements
