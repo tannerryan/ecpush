@@ -227,7 +227,7 @@ func (client *Client) consume() {
 				ContentFailure: false,
 			}
 
-			// send event to ouput channel as is or attempt to fetch content
+			// send event to output channel as is or attempt to fetch content
 			if client.NotifyOnly {
 				client.out <- event
 			} else {
