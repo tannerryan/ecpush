@@ -6,10 +6,14 @@
 ecpush is a Go library for subscribing to real-time meteorological data feeds from Environment Canada.
 
 
+## Documentation
+Please visit the corresponding [**GoDoc**](https://godoc.org/github.com/TheTannerRyan/ecpush) entry for all necessary documentation, including parameter definitions and program defaults.
+
+
 ## Goals
 The main goal of ecpush is to provide a simple and lightweight client that can be used for receiving real-time data events directly from Environment Canada's meteorological product feed.
 
-The client does not directly fetch the published products, but provides a notification channel containing the product location (HTTP URL to Environment Canada's Datamart).
+The client can directly fetch the published products, or it can just provide a notification channel containing the product location (HTTP URL to Environment Canada's Datamart). This can be set by modifying the `NotifyOnly` field in the `Client` struct.
 
 The client has also been designed to fully and properly recover from disconnections, without the need to prompt a reconnection.
 
@@ -20,7 +24,13 @@ The interface is very minimal. To create a new client, simply create a `Client` 
 Please see [subtopic amqp pattern](https://github.com/MetPX/sarracenia/blob/master/doc/sr_subscribe.1.rst#subtopic-amqp-pattern-subtopic-need-to-be-set) for formatting subtopics.
 ```
 client := ecpush.Client{
-	Subtopics: []string{"bulletins.alphanumeric.#", "citypage_weather.xml.#"},
+    Subtopics: []string{"bulletins.alphanumeric.#", "citypage_weather.xml.#"},
+    DisableRecovery:     false,
+    DisableEventLog:     false,
+    ReconnectDelay:      30,
+    NotifyOnly:          false,
+    DisableContentRetry: false,
+    ContentAttempts:     3,
 }
 ```
 When calling `Connect()` on the newly created client, two channels will be returned. A conditional on the done channel should be performed. A nil done channel after Connection will occur if the client cannot connect to the messaging broker and fault recovery is disabled.
@@ -30,7 +40,7 @@ To receive the Events, create a goroutine to range over the Event channel. The d
 if msg, done := client.Connect(); done != nil {
 	go func() {
 		for event := range msg {
-			log.Printf("%s; %s\n", event.URL, event.Md5)
+			log.Printf("%s\n", event)
 		}
 	}()
 	<-done
@@ -46,7 +56,7 @@ client.Close()
 
 
 ## Examples
-A fully functional client can be found in the example directory.
+Two fully functioning clients can be found in the example directory. `client_notify.go` only returns event notifications (without fetching the event contents). `client_content.go` returns events with the corresponding contents. Note that this feature is enabled/disabled by modifying the `NotifyOnly` flag in the Client struct.
 
 
 ## Acknowledgements
