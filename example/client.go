@@ -29,10 +29,10 @@ func main() {
 			for event := range msg {
 				log.Println(event.URL)
 				// Available Event Fields
-				//	- event.URL				:: HTTP URL of event
-				//	- event.Md5				:: MD5 checksum of event content
-				//	- event.Content			:: verified event content (if NotifyOnly is disabled)
-				//	- event.ContentFailure	:: indicator if content fetch failed (Content will be empty string)
+				//	- event.URL :: HTTP URL of event
+				//	- event.Md5 :: MD5 checksum of event content
+				//	- event.Content :: verified event content (if NotifyOnly is disabled)
+				//	- event.ContentFailure :: indicator if content fetch failed (Content will be empty string)
 			}
 		}()
 		<-done
