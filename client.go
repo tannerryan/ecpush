@@ -26,9 +26,11 @@ const (
 	pass            = "anonymous"        // AMQP password (default: anonymous)
 	prefix          = "v02.post."        // AMQP routing key prefix (default: v02.post)
 	heartbeat       = 60 * time.Second   // AMQP heartbeat interval (default: 60 seconds)
+	qosPrefetch     = 10                 // AMQP qos prefetch count (default: 10)
 	connDelay       = 10 * time.Second   // default reconnection delay (default: 10 seconds)
 	recoverDelay    = 1 * time.Second    // malformed message recovery delay (default: 1 seconds)
 	contentAttempts = 3                  // number of HTTP content fetch attempts (default: 3)
+	httpTimeout     = 60 * time.Second   // http fetch timeout (default: 60 seconds)
 )
 
 // Client contains the entire amqp configuration.
@@ -43,14 +45,16 @@ type Client struct {
 	conn                *amqp.Connection // streadway amqp.Connection
 	ch                  *amqp.Channel    // streadway amqp.Channel
 	q                   amqp.Queue       // streadway amqp.Queue
-	out                 chan Event       // client Event output channel
+	out                 chan *Event      // client Event output channel
 	done                chan bool        // client done signaling channel
+	httpClient          *http.Client     // net http client for sending HTTP requests
 }
 
 // An Event contains a subscribed product announcement.
 type Event struct {
 	URL            string // url of the product (located on Datamart)
 	Md5            string // md5 hash of product (used for validating file downloads)
+	Route          string // AMQP routing key of event
 	Content        string // event contents (if NotifyOnly is false)
 	ContentFailure bool   // indicator if event fetching failed
 }
@@ -59,7 +63,7 @@ type Event struct {
 // for receiving products. It will return an Event channel containing
 // events for all subscribed subtopics. It will also return a bool
 // channel for signaling client closure.
-func (client *Client) Connect() (<-chan Event, chan bool) {
+func (client *Client) Connect() (<-chan *Event, chan bool) {
 	client.prime()
 	client.connect()
 
@@ -85,8 +89,17 @@ func (client *Client) Close() {
 // bootstraping.
 func (client *Client) prime() {
 	// make channel for output Event and signaling completion
-	out, done := make(chan Event), make(chan bool, 1)
+	out, done := make(chan *Event, qosPrefetch), make(chan bool, 1)
 	client.out, client.done = out, done
+
+	// http client
+	httpClient := &http.Client{
+		Timeout: httpTimeout,
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+		},
+	}
+	client.httpClient = httpClient
 
 	// client bootstraping
 	if client.ReconnectDelay == 0*time.Second {
@@ -117,7 +130,7 @@ func (client *Client) connect() {
 	client.log("Connected to " + broker)
 
 	// declare amqp channel
-	ch, err := conn.Channel()
+	ch, err := client.conn.Channel()
 	if err != nil {
 		client.error("Failed to declare channel")
 		return
@@ -150,7 +163,7 @@ func (client *Client) connect() {
 	qID := qPrefix + "." + qIdentifer + "." + qMode + "." + fmt.Sprintf("%x", q1) + "." + fmt.Sprintf("%x", q2)
 
 	// declare amqp queue
-	q, err := ch.QueueDeclare(
+	q, err := client.ch.QueueDeclare(
 		qID,   // name
 		false, // durable
 		true,  // delete when unused
@@ -165,10 +178,22 @@ func (client *Client) connect() {
 	client.q = q
 	client.log("Declared message queue " + qID)
 
+	// declare channel quality of service
+	err = client.ch.Qos(
+		qosPrefetch, // prefetch count
+		0,           // prefetch size
+		false,       // global qos
+	)
+	if err != nil {
+		client.error("Failed to set channel QoS")
+		return
+	}
+	client.log("Channel QoS successfully configured")
+
 	// bind to provided subtopics
 	for _, subtopic := range client.Subtopics {
-		err = ch.QueueBind(
-			q.Name,          // queue name
+		err = client.ch.QueueBind(
+			client.q.Name,   // queue name
 			prefix+subtopic, // routing key
 			"xpublic",       // exchange
 			false,           // no wait
@@ -220,18 +245,20 @@ func (client *Client) consume() {
 			sum := d.Headers["sum"].(string)[2:]
 
 			// basic event structure
-			event := Event{
+			event := &Event{
 				URL:            string(uri[1] + uri[2]),
 				Md5:            sum,
+				Route:          d.RoutingKey,
 				Content:        "",
 				ContentFailure: false,
 			}
-
 			// send event to output channel as is or attempt to fetch content
 			if client.NotifyOnly {
 				client.out <- event
 			} else {
-				go client.fetchContent(event)
+				done := make(chan bool, 1)
+				go client.fetchContent(event, done)
+				<-done
 			}
 
 			d.Ack(false)
@@ -266,59 +293,65 @@ func (client *Client) error(err string) {
 	}
 }
 
-// fetchContent will attempt to fetch the contents of an event,
-// update the event contents and send the updated event to the
-// client's output channel.
-func (client *Client) fetchContent(event Event) {
-	content, err := fetchEvent(event, !client.DisableContentRetry, client.ContentAttempts)
+// fetchContent will attempt to fetch the contents of an event and
+// update the contents of the Event. It will also trigger the done
+// channel when completed.
+func (client *Client) fetchContent(event *Event, done chan bool) {
+	content, err := fetchEvent(client, event, !client.DisableContentRetry)
 	if err != nil {
 		if client.DisableContentRetry {
-			client.log("Failed to fetch event content; no retries were attempted")
+			client.log("Failed to fetch event content " + event.URL + "; no retries were attempted")
 		} else {
-			client.log("Failed to fetch event content; max number of attempts were performed")
+			client.log("Failed to fetch event content " + event.URL + "; max number of attempts were performed")
 		}
 		event.ContentFailure = true
 	} else {
-		event.Content = content
+		event.Content = string((*content)[:])
 	}
 
-	// send modified event to output channel
+	// send modified event to output channel and trigger done
 	client.out <- event
+	done <- true
 	return
 }
 
-// fetchEvent will fetch the HTTP contents of an Event
-func fetchEvent(event Event, multipleAttempts bool, attempts int) (string, error) {
+// fetchEvent will fetch the HTTP contents of an Event and return
+// a reference to the byte array or an error.
+func fetchEvent(client *Client, event *Event, multipleAttempts bool) (*[]byte, error) {
 	// wrapper for performing multiple attempts
 	if multipleAttempts {
-		remainingAttempts := attempts
+		remainingAttempts := client.ContentAttempts
 		for remainingAttempts > 0 {
-			content, err := fetchEvent(event, false, attempts)
+			content, err := fetchEvent(client, event, false)
 			if err != nil {
 				remainingAttempts--
 			} else {
 				return content, nil
 			}
 		}
-		return "", errors.New("failed to fetch event content")
+		return nil, errors.New("failed to fetch event content")
 	}
 
 	// fetch event through standard http
-	resp, err := http.Get(event.URL)
-	if err != nil {
-		return "", err
+	resp, err := client.httpClient.Get(event.URL)
+	if resp != nil {
+		defer resp.Body.Close()
 	}
-	defer resp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	// read response body
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	// validate checksum
 	bodyHash := fmt.Sprintf("%x", md5.Sum(body))
 	if string(bodyHash[:]) != event.Md5 {
-		return "", errors.New("invalid download; event hash does not match")
+		return nil, errors.New("invalid download; event hash does not match")
 	}
 
-	return string(body), nil
+	return &body, nil
 }

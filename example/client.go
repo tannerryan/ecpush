@@ -31,6 +31,7 @@ func main() {
 				// Available Event Fields
 				//	- event.URL :: HTTP URL of event
 				//	- event.Md5 :: MD5 checksum of event content
+				//  - event.Route: AMQP routing key of event
 				//	- event.Content :: verified event content (if NotifyOnly is disabled)
 				//	- event.ContentFailure :: indicator if content fetch failed (Content will be empty string)
 			}
