@@ -27,7 +27,8 @@ The interface is very minimal. To create a new client, simply
 create a Client struct. The only required field in the struct
 is the Subtopics array. Default values for the other fields
 are listed in the struct definition. An example configuration
-is shown below (subscribing to text bulletins and citypage XML).
+is shown below (subscribing to text bulletins, citypage XML and
+CAP alert files).
 
 Please see https://github.com/MetPX/sarracenia/blob/master/doc/sr_subscribe.1.rst#subtopic-amqp-pattern-subtopic-need-to-be-set
 for formatting subtopics.

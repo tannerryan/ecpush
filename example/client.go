@@ -13,13 +13,14 @@ import (
 func main() {
 	client := ecpush.Client{
 		Subtopics: []string{
+			"alerts.cap.#",
 			"bulletins.alphanumeric.#",
 			"citypage_weather.xml.#",
 		}, // array of subscribed subtopics (see above for formatting)
 		DisableRecovery:     false, // (default value) disable connection and fault recovery
 		DisableEventLog:     false, // (default value) disable event log
-		ReconnectDelay:      30,    // (default value) amqp reconnect delay
-		NotifyOnly:          false, // (default value) disable HTTP content fetching
+		ReconnectDelay:      10,    // (default value) amqp reconnect delay
+		NotifyOnly:          true,  // (default value) disable HTTP content fetching
 		DisableContentRetry: false, // (default value) disable multiple HTTP fetches in event of request failure
 		ContentAttempts:     3,     // (default value) number of HTTP fetch attempts
 	}
@@ -31,7 +32,7 @@ func main() {
 				// Available Event Fields
 				//	- event.URL :: HTTP URL of event
 				//	- event.Md5 :: MD5 checksum of event content
-				//  - event.Route: AMQP routing key of event
+				//	- event.Route :: AMQP routing key of event
 				//	- event.Content :: verified event content (if NotifyOnly is disabled)
 				//	- event.ContentFailure :: indicator if content fetch failed (Content will be empty string)
 			}

@@ -25,12 +25,12 @@ const (
 	user            = "anonymous"        // AMQP username (default: anonymous)
 	pass            = "anonymous"        // AMQP password (default: anonymous)
 	prefix          = "v02.post."        // AMQP routing key prefix (default: v02.post)
-	heartbeat       = 60 * time.Second   // AMQP heartbeat interval (default: 60 seconds)
-	qosPrefetch     = 10                 // AMQP qos prefetch count (default: 10)
+	heartbeat       = 30 * time.Second   // AMQP heartbeat interval (default: 30 seconds)
+	qosPrefetch     = 30                 // AMQP qos prefetch count (default: 30)
 	connDelay       = 10 * time.Second   // default reconnection delay (default: 10 seconds)
 	recoverDelay    = 1 * time.Second    // malformed message recovery delay (default: 1 seconds)
 	contentAttempts = 3                  // number of HTTP content fetch attempts (default: 3)
-	httpTimeout     = 60 * time.Second   // http fetch timeout (default: 60 seconds)
+	httpTimeout     = 15 * time.Second   // http fetch timeout (default: 15 seconds)
 )
 
 // Client contains the entire amqp configuration.
@@ -39,7 +39,7 @@ type Client struct {
 	DisableRecovery     bool             // disable connection and fault recovery (optional; default: false)
 	DisableEventLog     bool             // disable event log (optional; default: false)
 	ReconnectDelay      time.Duration    // amqp reconnect delay (default; default: 10 seconds)
-	NotifyOnly          bool             // disable HTTP content fetching (optional; default: false)
+	NotifyOnly          bool             // disable HTTP content fetching (optional; default: true)
 	DisableContentRetry bool             // disable multiple HTTP fetches in event of request failure (optional; default: false)
 	ContentAttempts     int              // number of HTTP fetch attempts (optional: default 3)
 	conn                *amqp.Connection // streadway amqp.Connection
@@ -300,9 +300,9 @@ func (client *Client) fetchContent(event *Event, done chan bool) {
 	content, err := fetchEvent(client, event, !client.DisableContentRetry)
 	if err != nil {
 		if client.DisableContentRetry {
-			client.log("Failed to fetch event content " + event.URL + "; no retries were attempted")
+			client.log("Failed to fetch event content; no retries were attempted")
 		} else {
-			client.log("Failed to fetch event content " + event.URL + "; max number of attempts were performed")
+			client.log("Failed to fetch event content; max number of attempts were performed")
 		}
 		event.ContentFailure = true
 	} else {
