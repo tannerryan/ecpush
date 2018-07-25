@@ -13,9 +13,7 @@ Please visit the corresponding [**GoDoc**](https://godoc.org/github.com/TheTanne
 ## Goals
 The main goal of ecpush is to provide a simple and lightweight client that can be used for receiving real-time data events directly from Environment Canada's meteorological product feed.
 
-The client can directly fetch the published products, or it can just provide a notification channel containing the product location (HTTP URL to Environment Canada's Datamart). This can be set by modifying the `NotifyOnly` field in the `Client` struct.
-
-The client has also been designed to fully and properly recover from disconnections, without the need to prompt a reconnection.
+The client can directly fetch the published products, or it can just provide a notification channel containing the product location (HTTP URL to Environment Canada's Datamart). The client has also been designed to automatically recover from any connection or channel interruptions.
 
 
 ## Usage
@@ -24,28 +22,25 @@ CAP alert files).
 
 Please see [subtopic amqp pattern](https://github.com/MetPX/sarracenia/blob/master/doc/sr_subscribe.1.rst#subtopic-amqp-pattern-subtopic-need-to-be-set) for formatting subtopics.
 ```
-client := ecpush.Client{
-    Subtopics: []string{"bulletins.alphanumeric.#", "citypage_weather.xml.#"},
-    DisableRecovery:     false,
-    DisableEventLog:     false,
-    ReconnectDelay:      30,
-    NotifyOnly:          false,
-    DisableContentRetry: false,
-    ContentAttempts:     3,
+client := &ecpush.Client{
+    Subtopics: &[]string{
+        "alerts.cap.#",
+        "bulletins.alphanumeric.#",
+        "citypage_weather.xml.#",
+    },
+    DisableEventLog: false,
+    FetchContent:    false,
 }
 ```
-When calling `Connect()` on the newly created client, two channels will be returned. A conditional on the done channel should be performed. A nil done channel after Connection will occur if the client cannot connect to the messaging broker and fault recovery is disabled.
-
-To receive the Events, create a goroutine to range over the Event channel. The done channel may be used to block the goroutine.
+When calling `Connect()` on the newly created client, two channels will be returned. To receive the Events, create a goroutine to range over the Event channel. The done channel may be used to block the goroutine.
 ```
-if msg, done := client.Connect(); done != nil {
-	go func() {
-		for event := range msg {
-			log.Printf("%s\n", event)
-		}
-	}()
-	<-done
-}
+msg, done := client.Connect()
+go func() {
+    for event := range msg {
+        log.Printf("[x] %s\n", event.URL)
+    }
+}()
+<-done
 ```
 To close the ecpush Client, simply call `Close()` on the client. This will
 close all active channels and connections to the messaging broker. It

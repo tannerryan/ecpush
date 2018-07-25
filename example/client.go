@@ -11,32 +11,21 @@ import (
 )
 
 func main() {
-	client := ecpush.Client{
-		Subtopics: []string{
+	client := &ecpush.Client{
+		Subtopics: &[]string{
 			"alerts.cap.#",
 			"bulletins.alphanumeric.#",
 			"citypage_weather.xml.#",
-		}, // array of subscribed subtopics (see above for formatting)
-		DisableRecovery:     false, // (default value) disable connection and fault recovery
-		DisableEventLog:     false, // (default value) disable event log
-		ReconnectDelay:      10,    // (default value) amqp reconnect delay
-		NotifyOnly:          true,  // (default value) disable HTTP content fetching
-		DisableContentRetry: false, // (default value) disable multiple HTTP fetches in event of request failure
-		ContentAttempts:     3,     // (default value) number of HTTP fetch attempts
+		}, // array of subscribed subtopics (see documentation for formatting)
+		DisableEventLog: false, // disable event log (default value)
+		FetchContent:    false, // enable HTTP content fetching (default value)
 	}
 
-	if msg, done := client.Connect(); done != nil {
-		go func() {
-			for event := range msg {
-				log.Println(event.URL)
-				// Available Event Fields
-				//	- event.URL :: HTTP URL of event
-				//	- event.Md5 :: MD5 checksum of event content
-				//	- event.Route :: AMQP routing key of event
-				//	- event.Content :: verified event content (if NotifyOnly is disabled)
-				//	- event.ContentFailure :: indicator if content fetch failed (Content will be empty string)
-			}
-		}()
-		<-done
-	}
+	msg, done := client.Connect()
+	go func() {
+		for event := range msg {
+			log.Printf("[x] %s\n", event.URL)
+		}
+	}()
+	<-done
 }
