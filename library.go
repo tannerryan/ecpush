@@ -26,7 +26,7 @@ const (
 	pass            = "anonymous"        // AMQP password
 	prefix          = "v02.post."        // AMQP routing key prefix
 	exchange        = "xpublic"          // AMQP exchange
-	qos             = 15                 // AMQP qos prefetch
+	qos             = 30                 // AMQP qos prefetch
 	recoverDelay    = 1 * time.Second    // reconnection + malformed message recovery delay
 	contentAttempts = 3                  // number of HTTP content fetch attempts
 	httpTimeout     = 15 * time.Second   // http fetch timeout
