@@ -7,6 +7,7 @@ package ecpush
 import (
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -21,7 +22,7 @@ import (
 
 const (
 	broker          = "dd.weather.gc.ca" // AMQP broker
-	port            = "5672"             // AMQP port
+	port            = "5671"             // AMQP port
 	user            = "anonymous"        // AMQP username
 	pass            = "anonymous"        // AMQP password
 	prefix          = "v02.post."        // AMQP routing key prefix
@@ -104,7 +105,9 @@ func (client *Client) prime() {
 func (client *Client) connect() {
 	var err error
 
-	client.conn, err = amqp.Dial("amqp://" + user + ":" + pass + "@" + broker + ":" + port + "/")
+	client.conn, err = amqp.DialTLS("amqps://"+user+":"+pass+"@"+broker+":"+port+"/", &tls.Config{
+		InsecureSkipVerify: true,
+	})
 	if err != nil {
 		client.error("Failed to connect to " + broker)
 		return
