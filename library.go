@@ -1,5 +1,5 @@
-// Copyright (c) 2018, Tanner Ryan. All rights reserved.
-// Use of this source code is governed by a BSD 2-clause
+// Copyright (c) 2018 Tanner Ryan. All rights reserved.
+// Use of this source code is governed by a MIT
 // license that can be found in the LICENSE file.
 
 package ecpush
@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	// Copyright (c) 2012, Sean Treadway, SoundCloud Ltd. All rights reserved.
+	// Copyright (c) 2012 Sean Treadway, SoundCloud Ltd. All rights reserved.
 	"github.com/streadway/amqp"
 )
 

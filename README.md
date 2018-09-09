@@ -60,6 +60,6 @@ I would like to thank [Sean Treadway](https://github.com/streadway/) for his Go 
 
 
 ## License
-Copyright (c) 2018, Tanner Ryan. All rights reserved. Use of this source code is governed by a BSD 2-clause license that can be found in the LICENSE file.
+Copyright (c) 2018 Tanner Ryan. All rights reserved. Use of this source code is governed by a MIT license that can be found in the LICENSE file.
 
-Sean Treadway's Go RabbitMQ client library is also under the a BSD 2-clause license. Once again, all rights reserved.
+Sean Treadway's Go RabbitMQ client library is under a BSD 2-clause license. Once again, all rights reserved.

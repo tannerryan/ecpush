@@ -1,5 +1,5 @@
-// Copyright (c) 2018, Tanner Ryan. All rights reserved.
-// Use of this source code is governed by a BSD 2-clause
+// Copyright (c) 2018 Tanner Ryan. All rights reserved.
+// Use of this source code is governed by a MIT
 // license that can be found in the LICENSE file.
 
 package main
