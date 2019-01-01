@@ -1,4 +1,17 @@
 language: go
+
 go:
   - "1.x"
+
 go_import_path: github.com/thetannerryan/ecpush
+
+before_install:
+  - go get -u github.com/golang/dep/cmd/dep
+  - npm install -g snyk
+
+script:
+  - make
+  - snyk test
+
+after_success:
+  - snyk monitor

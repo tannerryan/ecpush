@@ -1,8 +1,8 @@
-[![Build Status](https://travis-ci.org/TheTannerRyan/ecpush.svg?branch=master)](https://travis-ci.org/TheTannerRyan/ecpush) [![Go Report Card](https://goreportcard.com/badge/github.com/thetannerryan/ecpush)](https://goreportcard.com/report/github.com/thetannerryan/ecpush) [![GoDoc](https://godoc.org/github.com/TheTannerRyan/ecpush?status.svg)](https://godoc.org/github.com/TheTannerRyan/ecpush) 
-[![GitHub license](https://img.shields.io/github/license/thetannerryan/ecpush.svg)](https://github.com/TheTannerRyan/ecpush/blob/master/LICENSE)
-
-
 # ecpush
+[![Build Status](https://travis-ci.org/TheTannerRyan/ecpush.svg?branch=master)](https://travis-ci.org/TheTannerRyan/ecpush) [![Go Report Card](https://goreportcard.com/badge/github.com/thetannerryan/ecpush)](https://goreportcard.com/report/github.com/thetannerryan/ecpush) [![GoDoc](https://godoc.org/github.com/TheTannerRyan/ecpush?status.svg)](https://godoc.org/github.com/TheTannerRyan/ecpush) 
+[![GitHub
+license](https://img.shields.io/github/license/thetannerryan/ecpush.svg)](https://github.com/TheTannerRyan/ecpush/blob/master/LICENSE)
+
 ecpush is a Go library for subscribing to real-time meteorological data feeds from Environment Canada.
 
 
