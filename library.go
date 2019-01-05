@@ -1,6 +1,31 @@
-// Copyright (c) 2018 Tanner Ryan. All rights reserved.
-// Use of this source code is governed by a MIT
-// license that can be found in the LICENSE file.
+// BSD 3-Clause License
+//
+// Copyright (c) 2019 Tanner Ryan. All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
+//
+// 1. Redistributions of source code must retain the above copyright notice, this
+//    list of conditions and the following disclaimer.
+//
+// 2. Redistributions in binary form must reproduce the above copyright notice,
+//    this list of conditions and the following disclaimer in the documentation
+//    and/or other materials provided with the distribution.
+//
+// 3. Neither the name of the copyright holder nor the names of its
+//    contributors may be used to endorse or promote products derived from
+//    this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+// DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+// FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+// DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+// SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+// CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+// OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 package ecpush
 
@@ -16,8 +41,7 @@ import (
 	"strings"
 	"time"
 
-	// Copyright (c) 2012 Sean Treadway, SoundCloud Ltd. All rights reserved.
-	"github.com/streadway/amqp"
+	"github.com/streadway/amqp" // Copyright (c) 2012 Sean Treadway, SoundCloud Ltd. All rights reserved.
 )
 
 const (
@@ -63,10 +87,10 @@ type Event struct {
 	ContentFailure bool   // indicator if event fetching failed
 }
 
-// Connect will establish all connection and channels required
-// for receiving products. It will return an Event channel containing
-// events for all subscribed subtopics. It will also return a bool
-// channel for signaling client closure.
+// Connect will establish all connection and channels required for receiving
+// products. It will return an Event channel containing events for all
+// subscribed subtopics. It will also return a bool channel for signaling client
+// closure.
 func (client *Client) Connect() (<-chan *Event, chan bool) {
 	client.prime()
 	client.connect()
@@ -74,8 +98,8 @@ func (client *Client) Connect() (<-chan *Event, chan bool) {
 	return client.out, client.done
 }
 
-// Close will close all channels and connections to the amqp broker.
-// It will also push a message on the bool channel to signal closure.
+// Close will close all channels and connections to the amqp broker. It will
+// also push a message on the bool channel to signal closure.
 func (client *Client) Close() {
 	if client.ch != nil {
 		client.ch.Cancel("ecpush", true)
@@ -88,8 +112,7 @@ func (client *Client) Close() {
 	client.done <- true
 }
 
-// prime generates the client output and done channels for
-// Event streaming.
+// prime generates the client output and done channels for Event streaming.
 func (client *Client) prime() {
 	client.out, client.done = make(chan *Event), make(chan bool, 1)
 
@@ -99,9 +122,8 @@ func (client *Client) prime() {
 	}
 }
 
-// connect is responsible for establishing a connection
-// and a channel with the amqp messaging broker. It will
-// also call the consume function when ready.
+// connect is responsible for establishing a connection and a channel with the
+// amqp messaging broker. It will also call the consume function when ready.
 func (client *Client) connect() {
 	var err error
 
@@ -175,8 +197,8 @@ func (client *Client) connect() {
 	client.consume(q.Name)
 }
 
-// consume establishes a new channel consumer, generates
-// new events and publishes them on the client's out channel.
+// consume establishes a new channel consumer, generates new events and
+// publishes them on the client's out channel.
 func (client *Client) consume(qName string) {
 	messages, err := client.ch.Consume(
 		qName,    // queue
@@ -228,16 +250,16 @@ func (client *Client) consume(qName string) {
 	client.log("Consumer activated; messages now streaming to channel")
 }
 
-// log is a helper function to print debugging events if event
-// logging is not disabled.
+// log is a helper function to print debugging events if event logging is not
+// disabled.
 func (client *Client) log(data interface{}) {
 	if !client.DisableEventLog {
 		log.Println(data)
 	}
 }
 
-// error is a helper function to resolve any connection or
-// channel related issues.
+// error is a helper function to resolve any connection or channel related
+// issues.
 func (client *Client) error(err string) {
 	client.log(err)
 	if client.conn != nil {
@@ -248,9 +270,8 @@ func (client *Client) error(err string) {
 	client.connect()
 }
 
-// fetchContent will attempt to fetch the contents of an event and
-// update the contents of the Event. It will also trigger the done
-// channel when completed.
+// fetchContent will attempt to fetch the contents of an event and update the
+// contents of the Event. It will also trigger the done channel when completed.
 func (client *Client) fetchContent(event *Event, done chan bool) {
 	content, err := fetchEvent(event, true)
 	if err != nil {
@@ -265,8 +286,8 @@ func (client *Client) fetchContent(event *Event, done chan bool) {
 	return
 }
 
-// fetchEvent will fetch the HTTP contents of an Event and return
-// a reference to the byte array or an error.
+// fetchEvent will fetch the HTTP contents of an Event and return a reference to
+// the byte array or an error.
 func fetchEvent(event *Event, multipleAttempts bool) (*[]byte, error) {
 	if multipleAttempts {
 		remainingAttempts := contentAttempts
