@@ -1,7 +1,0 @@
-[[constraint]]
-  branch = "master"
-  name = "github.com/streadway/amqp"
-
-[prune]
-  go-tests = true
-  unused-packages = true
