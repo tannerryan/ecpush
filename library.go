@@ -48,6 +48,7 @@ const (
 	prefix          = "v02.post."        // AMQP routing key prefix
 	exchange        = "xpublic"          // AMQP exchange
 	qos             = 30                 // AMQP qos prefetch
+	queueExpiry     = 5 * time.Minute    // AMQP remote queue expiry (after disconnect)
 	recoverDelay    = 1 * time.Second    // reconnection + malformed message recovery delay
 	contentAttempts = 3                  // number of HTTP content fetch attempts
 	httpTimeout     = 15 * time.Second   // http fetch timeout
@@ -157,7 +158,9 @@ func (client *Client) connect() {
 		false, // delete when unused
 		false, // exclusive
 		false, // no wait
-		nil,   // arguments
+		amqp.Table{
+			"x-expires": int(queueExpiry.Seconds() * 1000), // RabbitMQ accepts milliseconds
+		}, // arguments
 	)
 	if err != nil {
 		client.error("Failed to declare queue")
