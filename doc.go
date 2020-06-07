@@ -3,7 +3,7 @@
 // license that can be found in the LICENSE file.
 
 /*
-Package ecpush is a library for subscribing to real-time meteorological data
+Package ecpush is a package for subscribing to real-time meteorological data
 feeds from Environment Canada.
 
 Goals
@@ -76,7 +76,7 @@ A fully functioning client can be found in the example directory.
 
 Acknowledgements
 
-I would like to thank Sean Treadway for his Go RabbitMQ client client. I would
+I would like to thank Sean Treadway for his Go RabbitMQ client package. I would
 also like to thank Environment Canada and the awesome people at Shared Services
 Canada for their developments and "openness" of MetPX and sarracenia.
 
@@ -85,7 +85,7 @@ License
 Copyright (c) 2019 Tanner Ryan. All rights reserved. Use of this source code is
 governed by a BSD-style license that can be found in the LICENSE file.
 
-Sean Treadway's Go RabbitMQ client client is under a BSD 2-clause license. Cenk
+Sean Treadway's Go RabbitMQ client package is under a BSD 2-clause license. Cenk
 Alti's Go exponential backoff package is under an MIT license. Once again, all
 rights reserved.
 
