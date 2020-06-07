@@ -7,7 +7,7 @@ Card](https://goreportcard.com/badge/github.com/thetannerryan/ecpush?style=flat-
 [![GitHub
 license](https://img.shields.io/github/license/TheTannerRyan/ecpush.svg?style=flat-square)](https://github.com/TheTannerRyan/ecpush/blob/master/LICENSE)
 
-ecpush is a Go library for subscribing to real-time meteorological data feeds
+ecpush is a Go package for subscribing to real-time meteorological data feeds
 from Environment Canada.
 
 
