@@ -26,6 +26,7 @@
 package ecpush
 
 import (
+	"context"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/tls"
@@ -37,258 +38,330 @@ import (
 	"strings"
 	"time"
 
-	"github.com/streadway/amqp" // Copyright (c) 2012 Sean Treadway, SoundCloud Ltd. All rights reserved.
+	"github.com/cenkalti/backoff/v4" // Copyright (c) 2014 Cenk Alti. All rights reserved.
+	"github.com/streadway/amqp"      // Copyright (c) 2012 Sean Treadway, SoundCloud Ltd. All rights reserved.
 )
 
 const (
 	broker          = "dd.weather.gc.ca" // AMQP broker
-	port            = "5671"             // AMQP port
+	brokerCert      = "weather.gc.ca"    // AMQP TLS hostname
+	port            = 5671               // AMQP port
 	user            = "anonymous"        // AMQP username
 	pass            = "anonymous"        // AMQP password
 	prefix          = "v02.post."        // AMQP routing key prefix
 	exchange        = "xpublic"          // AMQP exchange
 	qos             = 30                 // AMQP qos prefetch
 	queueExpiry     = 5 * time.Minute    // AMQP remote queue expiry (after disconnect)
-	recoverDelay    = 1 * time.Second    // reconnection + malformed message recovery delay
+	maxRecoverDelay = 16 * time.Second   // reconnection + malformed message max recovery delay
 	contentAttempts = 3                  // number of HTTP content fetch attempts
 	httpTimeout     = 15 * time.Second   // http fetch timeout
 )
 
 var (
+	// httpClient for fetching content
 	httpClient = &http.Client{
 		Timeout: httpTimeout,
 		Transport: &http.Transport{
 			DisableKeepAlives: true,
 		},
 	}
-	errGeneral = errors.New("")
+	// tlsConfig for AMQP connection
+	tlsConfig = &tls.Config{
+		ServerName: brokerCert,
+	}
+
+	// errNoSubtopics returned when no subtopics are provided
+	errNoSubtopics = errors.New("ecpush: must provide at least 1 subtopic before Connect()")
+	// errBadHash returned when hash of HTTP content does not match provided MD5
+	errBadHash = errors.New("ecpush: provided hash does not match received content")
+	// errFailedFetch returned when client fails to fetch HTTP content
+	errFailedFetch = errors.New("ecpush: failed to fetch content")
 )
 
-// Client contains the entire amqp configuration.
+// Client contains the ecpush consumer client.
 type Client struct {
-	Subtopics       *[]string        // array of subscribed subtopics (see documentation for formatting)
-	DisableEventLog bool             // disable event log (default: false)
-	FetchContent    bool             // enable HTTP content fetching (default: false)
-	conn            *amqp.Connection // streadway amqp.Connection
-	ch              *amqp.Channel    // streadway amqp.Channel
-	out             chan *Event      // client Event output channel
-	done            chan bool        // client done signaling channel
+	Subtopics       *[]string                   // Subtopics are array of subscribed subtopics (see documentation for formatting)
+	DisableEventLog bool                        // DisableEventLog disables the event log (default: false)
+	FetchContent    bool                        // FetchContent enables HTTP content fetching (default: false)
+	ctx             context.Context             // ctx is the parent context for cancellation
+	event           chan *Event                 // event is client Event channel for consume function
+	uid             string                      // uid is the unique client identifier
+	activated       bool                        // activated indicates if consumer is activated
+	conn            *amqp.Connection            // conn is streadway amqp.Connection
+	ch              *amqp.Channel               // ch is streadway amqp.Channel
+	delay           *backoff.ExponentialBackOff // delay is exponential backoff for connection recovery
 }
 
-// Event contains a subscribed product announcement.
+// Event is a received payload from Environment Canada's datamart.
 type Event struct {
-	URL            string // url of the product (located on Datamart)
-	Md5            string // md5 hash of product (used for content validation)
-	Route          string // AMQP routing key of event
-	Content        string // event contents (if FetchContent is true)
-	ContentFailure bool   // indicator if event fetching failed
+	URL            string // URL of the product (located on Datamart)
+	MD5            string // MD5 hash of product (used for content validation)
+	Route          string // Route is AMQP routing key of event
+	Content        string // Content is event contents (if FetchContent is true)
+	ContentFailure bool   // ContentFailure indicates if event fetching failed
 }
 
-// Connect will establish all connection and channels required for receiving
-// products. It will return an Event channel containing events for all
-// subscribed subtopics. It will also return a bool channel for signaling client
-// closure.
-func (client *Client) Connect() (<-chan *Event, chan bool) {
-	client.prime()
-	client.connect()
+// Connect establishes the AMQP channel for receiving products located on
+// provided subtopics. It blocks until the initial connection is established
+// with the remote server. Context is passed for closing the client. Connect
+// returns an error if no subtopics are provided.
+func (c *Client) Connect(ctx context.Context) error {
+	c.ctx = ctx
+	c.event = make(chan *Event)
 
-	return client.out, client.done
-}
+	// generate unique client identifier
+	q1, q2 := make([]byte, 5), make([]byte, 5)
+	rand.Read(q1)
+	rand.Read(q2)
+	c.uid = fmt.Sprintf("q_%s.ecpush.wx.%x.%x", user, q1, q2)
 
-// Close will close all channels and connections to the amqp broker. It will
-// also push a message on the bool channel to signal closure.
-func (client *Client) Close() {
-	if client.ch != nil {
-		client.ch.Cancel("ecpush", true)
-		client.ch.Close()
+	// exponential backoff for connection recovery (no max)
+	c.delay = backoff.NewExponentialBackOff()
+	c.delay.MaxInterval = maxRecoverDelay
+	c.delay.MaxElapsedTime = 0
+	c.delay.Reset()
+
+	// ensure at least one subtopic is provided
+	if len(*c.Subtopics) == 0 {
+		return errNoSubtopics
 	}
-	if client.conn != nil {
-		client.conn.Close()
-	}
 
-	client.done <- true
+	c.provision()
+	return nil
 }
 
-// prime generates the client output and done channels for Event streaming.
-func (client *Client) prime() {
-	client.out, client.done = make(chan *Event), make(chan bool, 1)
-
-	if len(*client.Subtopics) == 0 {
-		client.log("No subtopics were defined; exiting")
-		client.Close()
+// Consume returns the next event and an indicator if the client is not actively
+// consuming from the remote server.
+func (c *Client) Consume() (*Event, bool) {
+	if !c.activated {
+		// client not connected
+		return nil, true
+	}
+	select {
+	case <-c.ctx.Done():
+		// client closed
+		return nil, true
+	case e := <-c.event:
+		// next event
+		return e, false
 	}
 }
 
-// connect is responsible for establishing a connection and a channel with the
-// amqp messaging broker. It will also call the consume function when ready.
-func (client *Client) connect() {
-	var err error
+// close will terminate the provisioned AMQP channel and connection to the
+// remote server. It closes the main event channel.
+func (c *Client) close() {
+	c.log("[ecpush] received context cancellation, terminating consumer")
 
-	client.conn, err = amqp.DialTLS("amqps://"+user+":"+pass+"@"+broker+":"+port+"/", &tls.Config{
-		InsecureSkipVerify: true,
-	})
+	// cancel and close channel
+	if c.ch != nil {
+		c.ch.Cancel(c.uid, true)
+		c.ch.Close()
+	}
+	// close connection
+	if c.conn != nil {
+		c.conn.Close()
+	}
+
+	// no longer activated, close event channel
+	c.activated = false
+	close(c.event)
+}
+
+// provision establishes the AMQP connection and channel with the remote broker.
+// On success, the necessary AMQP queues, QoS settings, and bindings are
+// configured, and internal feed consumption will begin. If provisioning fails,
+// the recovery function is called.
+func (c *Client) provision() {
+	// establish connection with remote server
+	uri := fmt.Sprintf("amqps://%s:%s@%s:%d/", user, pass, broker, port)
+	conn, err := amqp.DialTLS(uri, tlsConfig)
 	if err != nil {
-		client.error("Failed to connect to " + broker)
+		c.recover("[ecpush] failed to connect to " + broker)
 		return
 	}
-	client.log("Connected to " + broker)
+	c.conn = conn
+	c.log("[ecpush] connected to " + broker)
 
 	go func() {
-		<-client.conn.NotifyClose(make(chan *amqp.Error))
-		client.error("Disconnected from " + broker)
+		// begin listening for connection errors, recover on error
+		<-c.conn.NotifyClose(make(chan *amqp.Error))
+		c.recover("[ecpush] disconnected from " + broker)
 		return
 	}()
 
-	client.ch, err = client.conn.Channel()
+	// establish consumption channel
+	ch, err := c.conn.Channel()
 	if err != nil {
-		client.error("Failed to declare channel")
+		c.recover("[ecpush] failed to declare channel")
 		return
 	}
-	client.log("Established channel")
+	c.ch = ch
+	c.log("[ecpush] declared channel")
 
-	qPrefix, qIdentifer, qMode := "q_"+user, "ecpush", "wx"
-	q1, q2 := make([]byte, 4), make([]byte, 4)
-	rand.Read(q1)
-	rand.Read(q2)
-	qID := qPrefix + "." + qIdentifer + "." + qMode + "." + fmt.Sprintf("%x", q1) + "." + fmt.Sprintf("%x", q2)
-
-	q, err := client.ch.QueueDeclare(
-		qID,   // name
+	// declare queue
+	q, err := c.ch.QueueDeclare(
+		c.uid, // name
 		false, // durable
 		false, // delete when unused
 		false, // exclusive
 		false, // no wait
 		amqp.Table{
-			"x-expires": int(queueExpiry.Seconds() * 1000), // RabbitMQ accepts milliseconds
+			"x-expires": int(queueExpiry.Milliseconds()), // RabbitMQ
 		}, // arguments
 	)
 	if err != nil {
-		client.error("Failed to declare queue")
+		c.recover("[ecpush] failed to declare queue")
 		return
 	}
-	client.log("Declared message queue " + qID)
+	c.log("[ecpush] declared queue " + c.uid)
 
-	if err = client.ch.Qos(
+	// set channel quality of service
+	if err = c.ch.Qos(
 		qos,   // prefetch count
 		0,     // prefetch size
 		false, // global qos
 	); err != nil {
-		client.error("Failed to set channel QoS")
+		c.recover("[ecpush] failed to configure channel QoS")
 		return
 	}
-	client.log("Channel QoS successfully configured")
+	c.log("[ecpush] configured channel QoS")
 
-	for _, subtopic := range *client.Subtopics {
-		if err = client.ch.QueueBind(
+	// subscribe to all subtopics
+	for _, subtopic := range *c.Subtopics {
+		if err = c.ch.QueueBind(
 			q.Name,          // queue name
 			prefix+subtopic, // routing key
 			exchange,        // exchange
 			false,           // no wait
 			nil,             // arguments
 		); err != nil {
-			client.error("Failed to bind " + prefix + subtopic)
+			c.recover("[ecpush] failed to bind queue " + prefix + subtopic)
 			return
 		}
-		client.log("Listening for messages on " + prefix + subtopic)
+		c.log("[ecpush] listening for messages on " + prefix + subtopic)
 	}
 
-	client.log("Client successfully connected; consumer ready to activate")
-	client.consume(q.Name)
+	c.log("[ecpush] client provisioned, activating consumer")
+	c.consume(q.Name)
 }
 
-// consume establishes a new channel consumer, generates new events and
-// publishes them on the client's out channel.
-func (client *Client) consume(qName string) {
-	messages, err := client.ch.Consume(
-		qName,    // queue
-		"ecpush", // consumer
-		false,    // auto ack
-		false,    // exclusive
-		false,    // no local
-		false,    // no wait
-		nil,      // arguments
+// consume establishes an internal channel consumer. A goroutine is created for
+// receiving events and emitting on event channel. The goroutine is terminated
+// upon context done signal.
+func (c *Client) consume(qName string) {
+	// consume from queue
+	messages, err := c.ch.Consume(
+		c.uid, // queue
+		c.uid, // consumer
+		false, // auto ack
+		false, // exclusive
+		false, // no local
+		false, // no wait
+		nil,   // arguments
 	)
 	if err != nil {
-		client.error("Failed to consume messages")
+		c.recover("[ecpush] failed to consume messages from queue")
 		return
 	}
 
 	go func() {
+		// if messages cannot be parsed successfully, sleep and recover
 		defer func() {
 			if r := recover(); r != nil {
-				client.log("Encountered malformed message; now recovering")
-				time.Sleep(recoverDelay)
-				client.consume(qName)
+				c.log("[ecpush] received malformed message")
+				c.consume(qName)
 				return
 			}
 		}()
 
+		// receive raw messages (event loop)
 		for d := range messages {
-			uri := strings.Split(string(d.Body), " ")
-			sum := d.Headers["sum"].(string)[2:]
-			event := &Event{
-				URL:            string(uri[1] + uri[2]),
-				Md5:            sum,
-				Route:          d.RoutingKey,
-				Content:        "",
-				ContentFailure: false,
-			}
+			select {
+			case <-c.ctx.Done():
+				// exit on end signal
+				return
+			default:
+				// parse raw payload and generate event
+				uri := strings.Split(string(d.Body), " ")
+				sum := d.Headers["sum"].(string)[2:]
+				event := &Event{
+					URL:            string(uri[1] + uri[2]),
+					MD5:            sum,
+					Route:          d.RoutingKey,
+					Content:        "",
+					ContentFailure: false,
+				}
 
-			if !client.FetchContent {
-				client.out <- event
-			} else {
-				done := make(chan bool, 1)
-				go client.fetchContent(event, done)
-				<-done
-			}
+				// fetch content and update event if required
+				if c.FetchContent {
+					c.fetchContent(event)
+				}
 
-			d.Ack(false)
+				// emit and acknowledge event
+				c.event <- event
+				d.Ack(false)
+			}
 		}
 	}()
 
-	client.log("Consumer activated; messages now streaming to channel")
+	c.activated = true
+	c.delay.Reset()
+	c.log("[ecpush] consumer activated, ready for consumption")
+
+	// close the client on exit signal
+	go func(c *Client) {
+		<-c.ctx.Done()
+		c.close()
+	}(c)
 }
 
-// log is a helper function to print debugging events if event logging is not
-// disabled.
-func (client *Client) log(data interface{}) {
-	if !client.DisableEventLog {
+// log internally logs events if enabled.
+func (c *Client) log(data interface{}) {
+	if !c.DisableEventLog {
 		log.Println(data)
 	}
 }
 
-// error is a helper function to resolve any connection or channel related
-// issues.
-func (client *Client) error(err string) {
-	client.log(err)
-	if client.conn != nil {
-		client.conn.Close()
+// recover restarts the provisioning process after an exponential backoff delay.
+// It should be called on any error preventing data consumption.
+func (c *Client) recover(err string) {
+	// log provided error
+	c.log(err)
+	// close channel and connections if defined
+	if c.ch != nil {
+		c.ch.Close()
 	}
-	client.log("Waiting for delay to attempt reconnection")
-	time.Sleep(recoverDelay)
-	client.connect()
+	if c.conn != nil {
+		c.conn.Close()
+	}
+	// sleep and re-provision
+	delay := c.delay.NextBackOff()
+	c.log("[ecpush] waiting " + delay.String() + " for reconnect")
+	time.Sleep(delay)
+	c.provision()
 }
 
-// fetchContent will attempt to fetch the contents of an event and update the
-// contents of the Event. It will also trigger the done channel when completed.
-func (client *Client) fetchContent(event *Event, done chan bool) {
+// fetchContent accepts an Event and attempts to populate the Event with content
+// located at Event URL. If the content can not be fetched after multiple
+// attempts, the ContentFailure flag is set to true in the Event.
+func (c *Client) fetchContent(event *Event) {
+	// attempt to fetch content with multiple attempts
 	content, err := fetchEvent(event, true)
 	if err != nil {
-		client.log("Failed to fetch event content")
+		c.log("[ecpush] failed to fetch event content")
 		event.ContentFailure = true
 	} else {
+		// populate event content
 		event.Content = string((*content)[:])
 	}
-
-	client.out <- event
-	done <- true
-	return
 }
 
-// fetchEvent will fetch the HTTP contents of an Event and return a reference to
-// the byte array or an error.
+// fetchEvent recursively attempts to fetch the HTTP contents of an Event. It
+// returns the byte content of the event or an error if all content fetch
+// attempts return an error.
 func fetchEvent(event *Event, multipleAttempts bool) (*[]byte, error) {
 	if multipleAttempts {
+		// recursively fetch content until success or no attempts remaining
 		remainingAttempts := contentAttempts
 		for remainingAttempts > 0 {
 			content, err := fetchEvent(event, false)
@@ -298,9 +371,10 @@ func fetchEvent(event *Event, multipleAttempts bool) (*[]byte, error) {
 				return content, nil
 			}
 		}
-		return nil, errGeneral
+		// ran out of attempts
+		return nil, errFailedFetch
 	}
-
+	// fetch the event contents at URL
 	resp, err := httpClient.Get(event.URL)
 	if resp != nil {
 		defer resp.Body.Close()
@@ -308,16 +382,17 @@ func fetchEvent(event *Event, multipleAttempts bool) (*[]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-
+	// read body
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
-
+	// check the event hash to hash of body
 	bodyHash := fmt.Sprintf("%x", md5.Sum(body))
-	if string(bodyHash[:]) != event.Md5 {
-		return nil, errGeneral
+	if string(bodyHash[:]) != event.MD5 {
+		// bad hash
+		return nil, errBadHash
 	}
-
+	// return body
 	return &body, nil
 }

@@ -3,7 +3,7 @@
 Status](https://img.shields.io/travis/TheTannerRyan/ecpush.svg?style=flat-square)](https://travis-ci.org/TheTannerRyan/ecpush)
 [![Go Report
 Card](https://goreportcard.com/badge/github.com/thetannerryan/ecpush?style=flat-square)](https://goreportcard.com/report/github.com/thetannerryan/ecpush)
-[![GoDoc](https://img.shields.io/badge/godoc-reference-5673AF.svg?style=flat-square)](https://godoc.org/github.com/TheTannerRyan/ecpush)
+[![GoDoc](https://img.shields.io/badge/godoc-reference-5673AF.svg?style=flat-square)](https://pkg.go.dev/github.com/thetannerryan/ecpush)
 [![GitHub
 license](https://img.shields.io/github/license/TheTannerRyan/ecpush.svg?style=flat-square)](https://github.com/TheTannerRyan/ecpush/blob/master/LICENSE)
 
@@ -13,7 +13,7 @@ from Environment Canada.
 
 ## Documentation
 Please visit the corresponding
-[**GoDoc**](https://godoc.org/github.com/TheTannerRyan/ecpush) entry for all
+[**GoDoc**](https://pkg.go.dev/github.com/thetannerryan/ecpush) entry for all
 necessary documentation, including parameter definitions and program defaults.
 
 
@@ -29,16 +29,15 @@ from any connection or channel interruptions.
 
 
 ## Usage
-The interface is very minimal. To create a new client, simply create a `Client`
-struct. The only required field in the struct is the Subtopics array. Default
-values for the other fields are listed in the struct definition. An example
-configuration is shown below (subscribing text bulletins, citypage XML and CAP
-alert files).
+To create a new client, create a `Client` struct. The only required field is the
+`Subtopics` array. Default values for other fields are listed in the struct
+definition. An example configuration is shown below (subscribing text bulletins,
+citypage XML and CAP alert files).
 
 Please see [subtopic amqp
 pattern](https://github.com/MetPX/sarracenia/blob/master/doc/sr_subscribe.1.rst#subtopic-amqp-pattern-subtopic-need-to-be-set)
 for formatting subtopics.
-```
+```go
 client := &ecpush.Client{
     Subtopics: &[]string{
         "alerts.cap.#",
@@ -49,24 +48,38 @@ client := &ecpush.Client{
     FetchContent:    false,
 }
 ```
-When calling `Connect()` on the newly created client, two channels will be
-returned. To receive the Events, create a goroutine to range over the Event
-channel. The done channel may be used to block the goroutine.
+Calling `Connect(ctx)` will return an error if no subtopics are provided. The
+function will block until the initial connection with the remote server is
+established. When the client is provisioned, an internal Goroutine is created to
+consume the feed.
+```go
+// create context for closing client
+ctx := context.Background()
+ctx, cancel := context.WithCancel(ctx)
+
+err := client.Connect(ctx)
+if err != nil {
+    panic(err)
+}
 ```
-msg, done := client.Connect()
-go func() {
-    for event := range msg {
-        log.Printf("[x] %s\n", event.URL)
+To consume the events, call `Consume()` on the client. This returns an `Event`
+and an indicator if the client is still actively consuming from the remote
+server.
+```go
+for {
+    event, closed := client.Consume()
+    if closed {
+        // not actively consuming
+        return
     }
-}()
-<-done
+    log.Println(event)
+}
 ```
-To close the ecpush Client, simply call `Close()` on the client. This will close
-all active channels and connections to the messaging broker. It will also signal
-the done channel which will close the holding goroutine previously created
-above.
-```
-client.Close()
+To close the client, call the cancel function on the context provided to the
+client. This will gracefully close the active channels and connection to the
+remote server.
+```go
+close()
 ```
 
 
@@ -76,7 +89,7 @@ A fully functioning client can be found in the example directory.
 
 ## Acknowledgements
 I would like to thank [Sean Treadway](https://github.com/streadway/) for his Go
-RabbitMQ client [library](https://github.com/streadway/amqp). I would also like
+RabbitMQ client [package](https://github.com/streadway/amqp). I would also like
 to thank Environment Canada and the awesome people at Shared Services Canada for
 their developments and "openness" of MetPX and
 [sarracenia](https://github.com/MetPX/sarracenia).
@@ -86,5 +99,6 @@ their developments and "openness" of MetPX and
 Copyright (c) 2019 Tanner Ryan. All rights reserved. Use of this source code is
 governed by a BSD-style license that can be found in the LICENSE file.
 
-Sean Treadway's Go RabbitMQ client library is under a BSD 2-clause license. Once
-again, all rights reserved.
+Sean Treadway's Go RabbitMQ client package is under a BSD 2-clause license. Cenk
+Alti's Go exponential backoff package is under an MIT license. Once again, all
+rights reserved.

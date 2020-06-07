@@ -19,11 +19,10 @@ from any connection or channel interruptions.
 
 Usage
 
-The interface is very minimal. To create a new client, simply create a Client
-struct. The only required field in the struct is the Subtopics array. Default
-values for the other fields are listed in the struct definition. An example
-configuration is shown below (subscribing to text bulletins, citypage XML and
-CAP alert files).
+To create a new client, create a Client struct. The only required field is the
+Subtopics array. Default values for other fields are listed in the struct
+definition. An example configuration is shown below (subscribing text bulletins,
+citypage XML and CAP alert files).
 
 Please see
 https://github.com/MetPX/sarracenia/blob/master/doc/sr_subscribe.1.rst#subtopic-amqp-pattern-subtopic-need-to-be-set
@@ -39,24 +38,37 @@ for formatting subtopics.
         FetchContent:    false,
     }
 
-When calling `Connect()` on the newly created client, two channels will be
-returned. To receive the Events, create a goroutine to range over the Event
-channel. The done channel may be used to block the goroutine.
+Calling Connect(ctx) will return an error if no subtopics are provided. The
+function will block until the initial connection with the remote server is
+established. When the client is provisioned, an internal Goroutine is created to
+consume the feed.
 
-    msg, done := client.Connect()
-    go func() {
-        for event := range msg {
-            log.Printf("[x] %s\n", event.URL)
+    // create context for closing client
+    ctx := context.Background()
+    ctx, cancel := context.WithCancel(ctx)
+
+    err := client.Connect(ctx)
+    if err != nil {
+        panic(err)
+    }
+
+To consume the events, call Consume() on the client. This returns an Event and
+an indicator if the client is still actively consuming from the remote server.
+
+    for {
+        event, closed := client.Consume()
+        if closed {
+            // not actively consuming
+            return
         }
-    }()
-    <-done
+        log.Println(event)
+    }
 
-To close the ecpush Client, simply call Close() on the client. This will close
-all active channels and connections to the messaging broker. It will also signal
-the done channel which will close the holding goroutine previously created
-above.
+To close the client, call the cancel function on the context provided to the
+client. This will gracefully close the active channels and connection to the
+remote server.
 
-    client.Close()
+    close()
 
 Examples
 
@@ -64,7 +76,7 @@ A fully functioning client can be found in the example directory.
 
 Acknowledgements
 
-I would like to thank Sean Treadway for his Go RabbitMQ client library. I would
+I would like to thank Sean Treadway for his Go RabbitMQ client client. I would
 also like to thank Environment Canada and the awesome people at Shared Services
 Canada for their developments and "openness" of MetPX and sarracenia.
 
@@ -73,8 +85,9 @@ License
 Copyright (c) 2019 Tanner Ryan. All rights reserved. Use of this source code is
 governed by a BSD-style license that can be found in the LICENSE file.
 
-Sean Treadway's Go RabbitMQ client library is under a BSD 2-clause license. Once
-again, all rights reserved.
+Sean Treadway's Go RabbitMQ client client is under a BSD 2-clause license. Cenk
+Alti's Go exponential backoff package is under an MIT license. Once again, all
+rights reserved.
 
 */
 package ecpush

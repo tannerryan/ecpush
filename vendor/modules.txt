@@ -1,2 +1,4 @@
-# github.com/streadway/amqp v0.0.0-20190404075320-75d898a42a94
+# github.com/cenkalti/backoff/v4 v4.0.2
+github.com/cenkalti/backoff/v4
+# github.com/streadway/amqp v0.0.0-20190827072141-edfb9018d271
 github.com/streadway/amqp
