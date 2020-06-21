@@ -1,4 +1,4 @@
-module github.com/thetannerryan/ecpush/v2
+module github.com/thetannerryan/ecpush
 
 go 1.14
 

@@ -10,7 +10,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/thetannerryan/ecpush/v2"
+	"github.com/thetannerryan/ecpush"
 )
 
 func main() {
