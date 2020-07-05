@@ -325,6 +325,12 @@ func (c *Client) log(data interface{}) {
 // recover restarts the provisioning process after an exponential backoff delay.
 // It should be called on any error preventing data consumption.
 func (c *Client) recover(err string) {
+	select {
+	case <-c.ctx.Done():
+		// do not recover on cancellation
+		return
+	default:
+	}
 	// log provided error
 	c.log(err)
 	// close channel and connections if defined
