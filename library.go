@@ -186,7 +186,6 @@ func (c *Client) provision() {
 		// begin listening for connection errors, recover on error
 		<-c.conn.NotifyClose(make(chan *amqp.Error))
 		c.recover("[ecpush] disconnected from " + broker)
-		return
 	}()
 
 	// establish consumption channel
@@ -283,6 +282,12 @@ func (c *Client) consume(qName string) {
 			default:
 				// parse raw payload and generate event
 				uri := strings.Split(string(d.Body), " ")
+
+				// correct bad paths from remote
+				if !strings.HasPrefix(uri[2], "/") {
+					uri[2] = "/" + uri[2]
+				}
+
 				sum := d.Headers["sum"].(string)[2:]
 				event := &Event{
 					URL:            string(uri[1] + uri[2]),
