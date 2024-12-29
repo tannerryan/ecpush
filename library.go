@@ -54,7 +54,8 @@ const (
 	queueExpiry     = 5 * time.Minute    // AMQP remote queue expiry (after disconnect)
 	maxRecoverDelay = 16 * time.Second   // reconnection + malformed message max recovery delay
 	contentAttempts = 3                  // number of HTTP content fetch attempts
-	httpTimeout     = 15 * time.Second   // http fetch timeout
+	httpTimeout     = 10 * time.Second   // http fetch timeout
+	httpUserAgent   = "Mozilla/5.0 (compatible; Go-http-client/1.1; +https://github.com/tannerryan/ecpush)"
 )
 
 var (
@@ -283,11 +284,6 @@ func (c *Client) consume(qName string) {
 				// parse raw payload and generate event
 				uri := strings.Split(string(d.Body), " ")
 
-				// correct bad paths from remote
-				if !strings.HasPrefix(uri[2], "/") {
-					uri[2] = "/" + uri[2]
-				}
-
 				sum := d.Headers["sum"].(string)[2:]
 				event := &Event{
 					URL:            string(uri[1] + uri[2]),
@@ -386,7 +382,12 @@ func fetchEvent(event *Event, multipleAttempts bool) (*[]byte, error) {
 		return nil, errFailedFetch
 	}
 	// fetch the event contents at URL
-	resp, err := httpClient.Get(event.URL)
+	req, err := http.NewRequest(http.MethodGet, event.URL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", httpUserAgent)
+	resp, err := httpClient.Do(req)
 	if resp != nil {
 		defer resp.Body.Close()
 	}
