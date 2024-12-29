@@ -29,10 +29,11 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha512"
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -96,7 +97,8 @@ type Client struct {
 // Event is a received payload from Environment Canada's datamart.
 type Event struct {
 	URL            string // URL of the product (located on Datamart)
-	MD5            string // MD5 hash of product (used for content validation)
+	MD5            string // MD5 of product
+	SHA512         string // SHA512 of product
 	Route          string // Route is AMQP routing key of event
 	Content        string // Content is event contents (if FetchContent is true)
 	ContentFailure bool   // ContentFailure indicates if event fetching failed
@@ -283,14 +285,23 @@ func (c *Client) consume(qName string) {
 			default:
 				// parse raw payload and generate event
 				uri := strings.Split(string(d.Body), " ")
-
-				sum := d.Headers["sum"].(string)[2:]
 				event := &Event{
 					URL:            string(uri[1] + uri[2]),
-					MD5:            sum,
+					MD5:            "",
+					SHA512:         "",
 					Route:          d.RoutingKey,
 					Content:        "",
 					ContentFailure: false,
+				}
+
+				// determine checksum algorithm
+				sum := d.Headers["sum"].(string)
+				if strings.Contains(sum, "d,") {
+					// MD5, remove "d,"
+					event.MD5 = sum[2:]
+				} else if strings.Contains(sum, "s,") {
+					// SHA512, remove "s,"
+					event.SHA512 = sum[2:]
 				}
 
 				// fetch content and update event if required
@@ -395,16 +406,29 @@ func fetchEvent(event *Event, multipleAttempts bool) (*[]byte, error) {
 		return nil, err
 	}
 	// read body
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
-	// check the event hash to hash of body
-	bodyHash := fmt.Sprintf("%x", md5.Sum(body))
-	if string(bodyHash[:]) != event.MD5 {
-		// bad hash
-		return nil, errBadHash
+
+	// validate checksum
+	if event.MD5 != "" {
+		// use MD5
+		bodyHash := fmt.Sprintf("%x", md5.Sum(body))
+		if bodyHash != event.MD5 {
+			// bad hash
+			return nil, errBadHash
+		}
 	}
+	if event.SHA512 != "" {
+		// use SHA512
+		bodyHash := fmt.Sprintf("%x", sha512.Sum512(body))
+		if bodyHash != event.SHA512 {
+			// bad hash
+			return nil, errBadHash
+		}
+	}
+
 	// return body
 	return &body, nil
 }
