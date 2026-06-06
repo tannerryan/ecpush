@@ -1,8 +1,9 @@
-// Copyright (c) 2019 Tanner Ryan. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) 2019 Tanner Ryan. All rights reserved. Use of this source code
+// is governed by a BSD-style license that can be found in the LICENSE file.
 
 /*
+	*
+
 Package ecpush is a package for subscribing to real-time meteorological data
 feeds from Environment Canada.
 
@@ -57,7 +58,7 @@ an indicator if the client is still actively consuming from the remote server.
 	for {
 	    event, closed := client.Consume()
 	    if closed {
-	        // not actively consuming
+									// not actively consuming
 	        return
 	    }
 	    log.Println(event)
@@ -67,7 +68,7 @@ To close the client, call the cancel function on the context provided to the
 client. This will gracefully close the active channels and connection to the
 remote server.
 
-	close()
+	cancel()
 
 # Examples
 
@@ -75,17 +76,19 @@ A fully functioning client can be found in the example directory.
 
 # Acknowledgements
 
-I would like to thank Sean Treadway for his Go RabbitMQ client package. I would
-also like to thank Environment Canada and the awesome people at Shared Services
-Canada for their developments and "openness" of MetPX and sarracenia.
+I would like to thank Sean Treadway for his Go RabbitMQ client package, now
+maintained by the RabbitMQ team as amqp091-go. I would also like to thank
+Environment Canada and the awesome people at Shared Services Canada for their
+developments and "openness" of MetPX and sarracenia.
 
 # License
 
 Copyright (c) 2019 Tanner Ryan. All rights reserved. Use of this source code is
 governed by a BSD-style license that can be found in the LICENSE file.
 
-Sean Treadway's Go RabbitMQ client package is under a BSD 2-clause license. Cenk
-Alti's Go exponential backoff package is under an MIT license. Once again, all
-rights reserved.
+The RabbitMQ amqp091-go client is under a BSD 2-clause license. Cenk Alti's Go
+exponential backoff package is under an MIT license. Once again, all rights
+reserved.
+*
 */
 package ecpush

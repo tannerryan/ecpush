@@ -1,8 +1,7 @@
 module github.com/tannerryan/ecpush
 
-go 1.18
+go 1.23
 
-require (
-	github.com/cenkalti/backoff/v4 v4.2.0
-	github.com/streadway/amqp v1.0.0
-)
+require github.com/rabbitmq/amqp091-go v1.11.0
+
+require github.com/cenkalti/backoff/v5 v5.0.3

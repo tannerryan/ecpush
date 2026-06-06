@@ -1,19 +1,21 @@
-// Copyright (c) 2019 Tanner Ryan. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) 2019 Tanner Ryan. All rights reserved. Use of this source code
+// is governed by a BSD-style license that can be found in the LICENSE file.
 
 package main
 
 import (
 	"context"
 	"log"
+	"os/signal"
+	"syscall"
 
 	"github.com/tannerryan/ecpush"
 )
 
 func main() {
-	// create context for closing client
-	ctx := context.Background()
+	// cancel the client on interrupt or termination
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
 
 	client := &ecpush.Client{
 		Subtopics: &[]string{
@@ -25,8 +27,7 @@ func main() {
 	}
 
 	// connect to client
-	err := client.Connect(ctx)
-	if err != nil {
+	if err := client.Connect(ctx); err != nil {
 		panic(err)
 	}
 
