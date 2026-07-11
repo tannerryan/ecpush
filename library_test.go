@@ -60,6 +60,13 @@ func TestParseDelivery(t *testing.T) {
 			wantURL: "https://dd.weather.gc.ca/path/file.xml",
 		},
 		{
+			name:    "extra whitespace",
+			body:    "20200101   https://dd.weather.gc.ca/   path/file.xml",
+			sum:     nil,
+			ok:      true,
+			wantURL: "https://dd.weather.gc.ca/path/file.xml",
+		},
+		{
 			name: "too few fields",
 			body: "20200101 https://dd.weather.gc.ca/",
 			ok:   false,
@@ -145,6 +152,13 @@ func TestFetchEvent(t *testing.T) {
 }
 
 func TestConnectNoSubtopics(t *testing.T) {
+	t.Run("nil context", func(t *testing.T) {
+		c := &Client{}
+		if err := c.Connect(nil); !errors.Is(err, errNilContext) {
+			t.Fatalf("err = %v, want errNilContext", err)
+		}
+	})
+
 	t.Run("nil subtopics", func(t *testing.T) {
 		c := &Client{}
 		if err := c.Connect(context.Background()); !errors.Is(err, errNoSubtopics) {
@@ -158,6 +172,17 @@ func TestConnectNoSubtopics(t *testing.T) {
 			t.Fatalf("err = %v, want errNoSubtopics", err)
 		}
 	})
+}
+
+func TestConnectCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	subtopics := []string{"*.WXO-DD.citypage_weather.ON.#"}
+	c := &Client{Subtopics: &subtopics}
+	if err := c.Connect(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
 }
 
 func TestConsumeBeforeConnect(t *testing.T) {

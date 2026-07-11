@@ -30,19 +30,17 @@ from any connection or channel interruptions.
 
 To create a new client, create a `Client` struct. The only required field is the
 `Subtopics` array. Default values for other fields are listed in the struct
-definition. An example configuration is shown below (subscribing text bulletins,
-citypage XML and CAP alert files).
+definition. An example configuration is shown below (subscribing text bulletins
+and citypage XML files).
 
-Please see [subtopic amqp
-pattern](https://github.com/MetPX/sarracenia/blob/master/doc/sr_subscribe.1.rst#subtopic-amqp-pattern-subtopic-need-to-be-set)
+Please see [MSC Datamart documentation](https://eccc-msc.github.io/open-data/msc-datamart/readme_en/)
 for formatting subtopics.
 
 ```go
 client := &ecpush.Client{
     Subtopics: &[]string{
-        "alerts.cap.#",
-        "bulletins.alphanumeric.#",
-        "citypage_weather.xml.#",
+        "*.WXO-DD.citypage_weather.ON.#",
+        "*.WXO-DD.bulletins.alphanumeric.#",
     },
     DisableEventLog: false,
     FetchContent:    false,

@@ -78,6 +78,8 @@ var (
 
 	// errNoSubtopics returned when no subtopics are provided
 	errNoSubtopics = errors.New("ecpush: must provide at least 1 subtopic before Connect()")
+	// errNilContext returned when Connect receives a nil context
+	errNilContext = errors.New("ecpush: context must not be nil")
 	// errBadHash returned when hash of HTTP content does not match provided
 	// checksum
 	errBadHash = errors.New("ecpush: provided hash does not match received content")
@@ -118,6 +120,10 @@ type Event struct {
 // with the remote server (or the context is cancelled). Context is passed for
 // closing the client. Connect returns an error if no subtopics are provided.
 func (c *Client) Connect(ctx context.Context) error {
+	if ctx == nil {
+		return errNilContext
+	}
+
 	// ensure at least one subtopic is provided
 	if c.Subtopics == nil || len(*c.Subtopics) == 0 {
 		return errNoSubtopics
@@ -154,9 +160,10 @@ func (c *Client) Connect(ctx context.Context) error {
 	go c.run(ready)
 	select {
 	case <-ready:
+		return nil
 	case <-c.ctx.Done():
+		return c.ctx.Err()
 	}
-	return nil
 }
 
 // Consume returns the next event and an indicator if the client is no longer
@@ -339,7 +346,7 @@ func (c *Client) consume(messages <-chan amqp.Delivery) {
 // if the payload is malformed.
 func parseDelivery(d amqp.Delivery) (*Event, bool) {
 	// payload is "<timestamp> <base-url> <relative-path>"
-	parts := strings.Split(string(d.Body), " ")
+	parts := strings.Fields(string(d.Body))
 	if len(parts) < 3 {
 		return nil, false
 	}
