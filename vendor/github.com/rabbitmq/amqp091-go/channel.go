@@ -23,6 +23,38 @@ import (
 //	octet   short         long         size octets       octet
 const frameHeaderSize = 1 + 2 + 4 + 1
 
+// notifyTimeout bounds how long a notification send may block the reader
+// goroutine when a listener's channel is full.
+const notifyTimeout = 5 * time.Second
+
+// notifyAll broadcasts v to every listener, abandoning any individual send
+// that blocks for longer than notifyTimeout so a slow or full listener can
+// never wedge the reader goroutine. A single timer is reused across the whole
+// broadcast: this avoids allocating—and, on Go < 1.23, leaking for the full
+// timeout—a timer per send, which matters on hot paths such as publisher
+// confirms. No timer is allocated when there are no listeners.
+func notifyAll[T any](listeners []chan T, v T) {
+	if len(listeners) == 0 {
+		return
+	}
+	t := time.NewTimer(notifyTimeout)
+	defer t.Stop()
+	for _, c := range listeners {
+		if !t.Stop() {
+			// Drain the channel if the timer already fired so Reset is safe.
+			select {
+			case <-t.C:
+			default:
+			}
+		}
+		t.Reset(notifyTimeout)
+		select {
+		case c <- v:
+		case <-t.C:
+		}
+	}
+}
+
 /*
 Channel represents an AMQP channel. Used as a context for valid message
 exchange.  Errors on methods with this Channel as a receiver means this channel
@@ -31,8 +63,8 @@ should be discarded and a new channel established.
 type Channel struct {
 	destructorM sync.Mutex   // Mutex for destroying the channel.
 	destructed  bool         // Will be true if the channel has been destroyed, false otherwise.
+	closeOnce   sync.Once    // Ensures closeResources() runs at most once, however it's reached.
 	m           sync.Mutex   // Mutex for the channel.
-	confirmM    sync.Mutex   // Mutex for the publisher confirms state.
 	notifyM     sync.RWMutex // Mutex for the notify state.
 
 	connection *Connection
@@ -66,7 +98,7 @@ type Channel struct {
 
 	// Allocated when in confirm mode in order to track publish counter and order confirms
 	confirms   *confirms
-	confirming bool
+	confirming atomic.Bool
 
 	// Selects on any errors from shutdown during RPC
 	errors chan *Error
@@ -82,7 +114,114 @@ type Channel struct {
 	reconnecting sync.Mutex // Mutex for reconnecting channel.
 	lifeCycle    *lifeCycle // The current state of the channel.
 
+	closeInit atomic.Bool // Set by Close() before racing for reconnecting; see reconnectChannel().
+
+	// recoveringTopology is true while a recoverConnectionTopology pass owns
+	// this channel's reopen/redeclare sequence. watchChannel's NotifyClose
+	// listener checks this to avoid starting a redundant, competing
+	// Reconnect+RecoverTopology pass when a broker soft error (e.g. a
+	// PRECONDITION_FAILED from an entity the in-flight pass is already
+	// handling) closes the channel out from under it.
+	recoveringTopology atomic.Bool
+
 	recoveryCancels []chan struct{} // listeners for channel recovery cancellation
+}
+
+// QosConfig holds QoS configuration settings for recovery.
+type QosConfig struct {
+	PrefetchCount uint16
+	PrefetchSize  uint32
+	Global        bool
+}
+
+// ExchangeConfig holds Exchange configuration settings for recovery.
+type ExchangeConfig struct {
+	Name       string
+	Kind       string
+	Durable    bool
+	AutoDelete bool
+	Internal   bool
+	NoWait     bool
+	Args       Table
+}
+
+// QueueConfig holds Queue configuration settings for recovery.
+type QueueConfig struct {
+	DeclaredName string // Original name passed to QueueDeclare (could be "")
+	ActualName   string // Server-returned name
+	Durable      bool
+	AutoDelete   bool
+	Exclusive    bool
+	NoWait       bool
+	Args         Table
+}
+
+// BindingConfig holds Queue Binding configuration settings for recovery.
+type BindingConfig struct {
+	Queue    string
+	Key      string
+	Exchange string
+	NoWait   bool
+	Args     Table
+}
+
+// ExchangeBindingConfig holds Exchange Binding configuration settings for recovery.
+type ExchangeBindingConfig struct {
+	Destination string
+	Key         string
+	Source      string
+	NoWait      bool
+	Args        Table
+}
+
+// TopologyConfiguration holds all tracked topology configurations for recovery.
+type TopologyConfiguration struct {
+	Qos              *QosConfig
+	Exchanges        map[string]ExchangeConfig
+	Queues           map[string]QueueConfig
+	Bindings         []BindingConfig
+	ExchangeBindings []ExchangeBindingConfig
+}
+
+func newTopologyConfiguration() *TopologyConfiguration {
+	return &TopologyConfiguration{
+		Exchanges: make(map[string]ExchangeConfig),
+		Queues:    make(map[string]QueueConfig),
+	}
+}
+
+// Clone returns a deep copy of the TopologyConfiguration.
+func (tc *TopologyConfiguration) Clone() *TopologyConfiguration {
+	clone := &TopologyConfiguration{}
+	if tc.Qos != nil {
+		qos := *tc.Qos
+		clone.Qos = &qos
+	}
+	clone.Exchanges = cloneMap(tc.Exchanges)
+	clone.Queues = cloneMap(tc.Queues)
+	clone.Bindings = cloneSlice(tc.Bindings)
+	clone.ExchangeBindings = cloneSlice(tc.ExchangeBindings)
+	return clone
+}
+
+func cloneMap[K comparable, V any](m map[K]V) map[K]V {
+	if m == nil {
+		return nil
+	}
+	result := make(map[K]V, len(m))
+	for k, v := range m {
+		result[k] = v
+	}
+	return result
+}
+
+func cloneSlice[T any](s []T) []T {
+	if s == nil {
+		return nil
+	}
+	result := make([]T, len(s), cap(s))
+	copy(result, s)
+	return result
 }
 
 // Constructs a new channel with the given framing rules
@@ -125,23 +264,38 @@ func (ch *Channel) shutdown(e *Error) {
 	ch.notifyM.Lock()
 	defer ch.notifyM.Unlock()
 
-	// Broadcast abnormal shutdown
+	// Broadcast abnormal shutdown.
 	if e != nil {
-		for _, c := range ch.closes {
-			select {
-			case c <- e:
-			default:
-				// If blocked/full, send in a goroutine so we never deadlock the shutdown sequence
-				go func(c chan *Error, e *Error) {
-					defer func() {
-						_ = recover() // Gracefully ignore panics if the channel is closed concurrently
-					}()
-					select {
-					case c <- e:
-					case <-time.After(5 * time.Second):
-						// Give up to avoid leaking the goroutine permanently
-					}
-				}(c, e)
+		// While an in-flight topology-recovery pass owns this channel
+		// (ch.recoveringTopology), skip notifying external NotifyClose
+		// listeners (including watchChannel's): Channel.reopenIfClosed is
+		// already reopening the channel in-band for this exact soft error,
+		// so a listener would otherwise start a redundant, competing
+		// recovery pass. This must happen here rather than only in the
+		// listener, because a full listener channel defers delivery up to
+		// notifyTimeout in the background goroutine below, by which time
+		// recoveringTopology may have already cleared — suppressing at the
+		// source avoids that race. ch.errors is unaffected: ch.call() (used
+		// by the in-band redeclare itself) depends on it to return promptly.
+		if !ch.recoveringTopology.Load() {
+			for _, c := range ch.closes {
+				select {
+				case c <- e:
+				default:
+					// Channel is full; deliver in a background goroutine so we never deadlock
+					// the shutdown sequence. The goroutine holds notifyM.RLock() for the
+					// duration of the send, which is mutually exclusive with cleanup()'s
+					// notifyM.Lock(), preventing a concurrent send+close data race.
+					go func(c chan *Error, e *Error) {
+						defer func() { _ = recover() }()
+						ch.notifyM.RLock()
+						defer ch.notifyM.RUnlock()
+						select {
+						case c <- e:
+						case <-time.After(5 * time.Second):
+						}
+					}(c, e)
+				}
 			}
 		}
 		// Notify RPC if we're selecting
@@ -151,48 +305,15 @@ func (ch *Channel) shutdown(e *Error) {
 		}
 	}
 
-	if e == nil || !ch.connection.IsRecoveryEnabled() || !ch.connection.isRecoverable(e) {
-		ch.consumers.close()
+	close(ch.errors)
+	close(ch.close)
 
-		for _, c := range ch.closes {
-			close(c)
-		}
-
-		for _, c := range ch.flows {
-			close(c)
-		}
-
-		for _, c := range ch.returns {
-			close(c)
-		}
-
-		for _, c := range ch.cancels {
-			close(c)
-		}
-
-		// Set the slices to nil to prevent the dispatch() range from sending on
-		// the now closed channels after we release the notifyM mutex
-		ch.flows = nil
-		ch.closes = nil
-		ch.returns = nil
-		ch.cancels = nil
-
-		if ch.confirms != nil {
-			ch.confirms.Close()
-		}
-
-		close(ch.errors)
-		close(ch.close)
-		ch.noNotify = true
-
+	if e == nil || !ch.connection.IsRecoveryEnabled() {
 		var err error
 		if e != nil {
-			err = fmt.Errorf("%w", e) // preserve the original error type for assertions
+			err = fmt.Errorf("channel shutdown error: %w", e) // errors.As(err, &target) still unwraps to *Error
 		}
-		ch.lifeCycle.SetState(StateClosed, err)
-	} else {
-		close(ch.errors)
-		close(ch.close)
+		ch.closeResources(err)
 	}
 }
 
@@ -221,14 +342,19 @@ func (ch *Channel) call(req message, res ...message) error {
 	}
 
 	if req.wait() {
+		ch.m.Lock()
+		errors := ch.errors
+		rpc := ch.rpc
+		ch.m.Unlock()
+
 		select {
-		case e, ok := <-ch.errors:
+		case e, ok := <-errors:
 			if ok {
 				return e
 			}
 			return ErrClosed
 
-		case msg := <-ch.rpc:
+		case msg := <-rpc:
 			if msg != nil {
 				for _, try := range res {
 					if reflect.TypeOf(msg) == reflect.TypeOf(try) {
@@ -366,32 +492,39 @@ func (ch *Channel) dispatch(msg message) {
 
 	case *channelFlow:
 		ch.notifyM.RLock()
-		for _, c := range ch.flows {
-			c <- m.Active
-		}
+		notifyAll(ch.flows, m.Active)
 		ch.notifyM.RUnlock()
 		if err := ch.send(&channelFlowOk{Active: m.Active}); err != nil {
 			Logger.Printf("error sending channelFlowOk, channel id: %d error: %+v", ch.id, err)
 		}
 
 	case *basicCancel:
+		queueName, _ := ch.consumers.queueForTag(m.ConsumerTag)
 		ch.notifyM.RLock()
-		for _, c := range ch.cancels {
-			c <- m.ConsumerTag
-		}
+		notifyAll(ch.cancels, m.ConsumerTag)
 		ch.notifyM.RUnlock()
 		ch.consumers.cancel(m.ConsumerTag)
+		if ch.connection.isCapable(serverCapabilityAcceptConsumerCancelOk) {
+			// Older servers cannot handle client-sent basic.cancel-ok.
+			// Serialize the response with concurrent basic.publish frames.
+			ch.m.Lock()
+			if err := ch.send(&basicCancelOk{ConsumerTag: m.ConsumerTag}); err != nil {
+				Logger.Printf("error sending basicCancelOk, channel id: %d error: %+v", ch.id, err)
+			}
+			ch.m.Unlock()
+		}
+		if queueName != "" {
+			ch.connection.maybeDeleteRecordedAutoDeleteQueue(queueName)
+		}
 
 	case *basicReturn:
 		ret := newReturn(*m)
 		ch.notifyM.RLock()
-		for _, c := range ch.returns {
-			c <- *ret
-		}
+		notifyAll(ch.returns, *ret)
 		ch.notifyM.RUnlock()
 
 	case *basicAck:
-		if ch.confirming {
+		if ch.confirming.Load() {
 			if m.Multiple {
 				ch.confirms.Multiple(Confirmation{m.DeliveryTag, true})
 			} else {
@@ -400,7 +533,7 @@ func (ch *Channel) dispatch(msg message) {
 		}
 
 	case *basicNack:
-		if ch.confirming {
+		if ch.confirming.Load() {
 			if m.Multiple {
 				ch.confirms.Multiple(Confirmation{m.DeliveryTag, false})
 			} else {
@@ -414,10 +547,15 @@ func (ch *Channel) dispatch(msg message) {
 		// deliveries are in flight and a no-wait cancel has happened
 
 	default:
+		ch.m.Lock()
+		closeCh := ch.close
+		rpc := ch.rpc
+		ch.m.Unlock()
+
 		select {
-		case <-ch.close:
+		case <-closeCh:
 			return
-		case ch.rpc <- msg:
+		case rpc <- msg:
 		}
 	}
 }
@@ -493,7 +631,11 @@ func (ch *Channel) recvContent(f frame) {
 
 	case *bodyFrame:
 		if cap(ch.body) == 0 {
-			ch.body = make([]byte, 0, ch.header.Size)
+			headerSize := ch.header.Size
+			if fs := uint64(ch.connection.Config.FrameSize); fs > 0 && headerSize > fs {
+				headerSize = fs
+			}
+			ch.body = make([]byte, 0, headerSize)
 		}
 		ch.body = append(ch.body, frame.Body...)
 
@@ -519,6 +661,22 @@ It is safe to call this method multiple times.
 */
 func (ch *Channel) Close() error {
 	ch.closeRecovery() // Stop any active recovery process
+
+	// Mark close-intent before racing for ch.reconnecting below. If
+	// reconnectChannel() hasn't started yet (e.g. it hasn't reached
+	// ch.reconnecting.Lock() and so closeRecovery() above found no cancel
+	// channel to close), it has no other way to learn a close was
+	// requested. reconnectChannel() re-checks this immediately after
+	// acquiring ch.reconnecting, so setting it first guarantees it aborts
+	// instead of running its full retry loop while this call waits behind
+	// it. See Connection.Close() for the analogous connection-level fix.
+	ch.closeInit.Store(true)
+
+	// Wait for any in-flight reconnectChannel() to fully settle before
+	// inspecting/tearing down state. See Connection.Close() for the analogous
+	// connection-level race this prevents.
+	ch.reconnecting.Lock()
+	defer ch.reconnecting.Unlock()
 
 	if ch.IsClosed() {
 		return nil
@@ -790,7 +948,12 @@ greater as described by benchmarks on RabbitMQ.
 http://www.rabbitmq.com/blog/2012/04/25/rabbitmq-performance-measurements-part-2/
 */
 func (ch *Channel) Qos(prefetchCount, prefetchSize int, global bool) error {
-	return ch.call(
+	// TODO: Change prefetchCount and prefetchSize types from int to uint16 and uint32 respectively.
+	// This will be a breaking change and should be done in a future major release.
+	if err := ch.validateQos(prefetchCount, prefetchSize); err != nil {
+		return err
+	}
+	err := ch.call(
 		&basicQos{
 			PrefetchCount: uint16(prefetchCount),
 			PrefetchSize:  uint32(prefetchSize),
@@ -798,6 +961,21 @@ func (ch *Channel) Qos(prefetchCount, prefetchSize int, global bool) error {
 		},
 		&basicQosOk{},
 	)
+	if err == nil && ch.connection.IsTopologyRecoveryEnabled() {
+		ch.connection.recordQos(ch.id, QosConfig{
+			PrefetchCount: uint16(prefetchCount),
+			PrefetchSize:  uint32(prefetchSize),
+			Global:        global,
+		})
+	}
+	return err
+}
+
+func (ch *Channel) validateQos(prefetchCount, prefetchSize int) error {
+	if prefetchCount < 0 || prefetchSize < 0 {
+		return fmt.Errorf("amqp: Qos values must be non-negative (got prefetchCount=%d, prefetchSize=%d)", prefetchCount, prefetchSize)
+	}
+	return nil
 }
 
 /*
@@ -819,6 +997,9 @@ require an acknowledgment, otherwise they will arrive and be dropped in the
 client without an ack, and will not be redelivered to other consumers.
 */
 func (ch *Channel) Cancel(consumer string, noWait bool) error {
+	// Look up the queue name before cancelling so we can check auto-delete after.
+	queueName, _ := ch.consumers.queueForTag(consumer)
+
 	req := &basicCancel{
 		ConsumerTag: consumer,
 		NoWait:      noWait,
@@ -834,6 +1015,10 @@ func (ch *Channel) Cancel(consumer string, noWait bool) error {
 	} else {
 		// Potentially could drop deliveries in flight
 		ch.consumers.cancel(consumer)
+	}
+
+	if queueName != "" {
+		ch.connection.maybeDeleteRecordedAutoDeleteQueue(queueName)
 	}
 
 	return nil
@@ -911,15 +1096,30 @@ func (ch *Channel) QueueDeclare(name string, durable, autoDelete, exclusive, noW
 		return Queue{}, err
 	}
 
+	actualName := name
 	if req.wait() {
-		return Queue{
-			Name:      res.Queue,
-			Messages:  int(res.MessageCount),
-			Consumers: int(res.ConsumerCount),
-		}, nil
+		actualName = res.Queue
 	}
 
-	return Queue{Name: name}, nil
+	q := Queue{
+		Name:      actualName,
+		Messages:  int(res.MessageCount),
+		Consumers: int(res.ConsumerCount),
+	}
+
+	if ch.connection.IsTopologyRecoveryEnabled() {
+		ch.connection.recordQueue(ch.id, QueueConfig{
+			DeclaredName: name,
+			ActualName:   actualName,
+			Durable:      durable,
+			AutoDelete:   autoDelete,
+			Exclusive:    exclusive,
+			NoWait:       noWait,
+			Args:         args,
+		})
+	}
+
+	return q, nil
 }
 
 /*
@@ -1042,7 +1242,7 @@ func (ch *Channel) QueueBind(name, key, exchange string, noWait bool, args Table
 		return err
 	}
 
-	return ch.call(
+	err := ch.call(
 		&queueBind{
 			Queue:      name,
 			Exchange:   exchange,
@@ -1052,6 +1252,16 @@ func (ch *Channel) QueueBind(name, key, exchange string, noWait bool, args Table
 		},
 		&queueBindOk{},
 	)
+	if err == nil && ch.connection.IsTopologyRecoveryEnabled() {
+		ch.connection.recordBinding(ch.id, BindingConfig{
+			Queue:    name,
+			Key:      key,
+			Exchange: exchange,
+			NoWait:   noWait,
+			Args:     args,
+		})
+	}
+	return err
 }
 
 /*
@@ -1063,7 +1273,7 @@ func (ch *Channel) QueueUnbind(name, key, exchange string, args Table) error {
 		return err
 	}
 
-	return ch.call(
+	err := ch.call(
 		&queueUnbind{
 			Queue:      name,
 			Exchange:   exchange,
@@ -1072,6 +1282,16 @@ func (ch *Channel) QueueUnbind(name, key, exchange string, args Table) error {
 		},
 		&queueUnbindOk{},
 	)
+	if err == nil && ch.connection.IsTopologyRecoveryEnabled() {
+		ch.connection.removeBinding(BindingConfig{
+			Queue:    name,
+			Key:      key,
+			Exchange: exchange,
+			Args:     args,
+		})
+		ch.connection.maybeDeleteRecordedAutoDeleteExchange(exchange)
+	}
+	return err
 }
 
 /*
@@ -1124,6 +1344,10 @@ func (ch *Channel) QueueDelete(name string, ifUnused, ifEmpty, noWait bool) (int
 	res := &queueDeleteOk{}
 
 	err := ch.call(req, res)
+	if err == nil && ch.connection.IsTopologyRecoveryEnabled() {
+		ch.connection.deleteRecordedQueue(name)
+		ch.consumers.cancelByQueue(name)
+	}
 
 	return int(res.MessageCount), err
 }
@@ -1411,7 +1635,7 @@ func (ch *Channel) ExchangeDeclare(name, kind string, durable, autoDelete, inter
 		return err
 	}
 
-	return ch.call(
+	err := ch.call(
 		&exchangeDeclare{
 			Exchange:   name,
 			Type:       kind,
@@ -1424,6 +1648,18 @@ func (ch *Channel) ExchangeDeclare(name, kind string, durable, autoDelete, inter
 		},
 		&exchangeDeclareOk{},
 	)
+	if err == nil && ch.connection.IsTopologyRecoveryEnabled() {
+		ch.connection.recordExchange(ch.id, ExchangeConfig{
+			Name:       name,
+			Kind:       kind,
+			Durable:    durable,
+			AutoDelete: autoDelete,
+			Internal:   internal,
+			NoWait:     noWait,
+			Args:       args,
+		})
+	}
+	return err
 }
 
 /*
@@ -1468,7 +1704,7 @@ been deleted.  Failing to delete the channel could close the channel.  Add a
 NotifyClose listener to respond to these channel exceptions.
 */
 func (ch *Channel) ExchangeDelete(name string, ifUnused, noWait bool) error {
-	return ch.call(
+	err := ch.call(
 		&exchangeDelete{
 			Exchange: name,
 			IfUnused: ifUnused,
@@ -1476,6 +1712,10 @@ func (ch *Channel) ExchangeDelete(name string, ifUnused, noWait bool) error {
 		},
 		&exchangeDeleteOk{},
 	)
+	if err == nil && ch.connection.IsTopologyRecoveryEnabled() {
+		ch.connection.deleteRecordedExchange(name)
+	}
+	return err
 }
 
 /*
@@ -1514,7 +1754,7 @@ func (ch *Channel) ExchangeBind(destination, key, source string, noWait bool, ar
 		return err
 	}
 
-	return ch.call(
+	err := ch.call(
 		&exchangeBind{
 			Destination: destination,
 			Source:      source,
@@ -1524,6 +1764,16 @@ func (ch *Channel) ExchangeBind(destination, key, source string, noWait bool, ar
 		},
 		&exchangeBindOk{},
 	)
+	if err == nil && ch.connection.IsTopologyRecoveryEnabled() {
+		ch.connection.recordExchangeBinding(ch.id, ExchangeBindingConfig{
+			Destination: destination,
+			Key:         key,
+			Source:      source,
+			NoWait:      noWait,
+			Args:        args,
+		})
+	}
+	return err
 }
 
 /*
@@ -1545,7 +1795,7 @@ func (ch *Channel) ExchangeUnbind(destination, key, source string, noWait bool, 
 		return err
 	}
 
-	return ch.call(
+	err := ch.call(
 		&exchangeUnbind{
 			Destination: destination,
 			Source:      source,
@@ -1555,6 +1805,17 @@ func (ch *Channel) ExchangeUnbind(destination, key, source string, noWait bool, 
 		},
 		&exchangeUnbindOk{},
 	)
+	if err == nil && ch.connection.IsTopologyRecoveryEnabled() {
+		ch.connection.removeExchangeBinding(ExchangeBindingConfig{
+			Destination: destination,
+			Key:         key,
+			Source:      source,
+			NoWait:      noWait,
+			Args:        args,
+		})
+		ch.connection.maybeDeleteRecordedAutoDeleteExchange(source)
+	}
+	return err
 }
 
 /*
@@ -1655,7 +1916,7 @@ func (ch *Channel) PublishWithDeferredConfirm(exchange, key string, mandatory, i
 	defer ch.m.Unlock()
 
 	var dc *DeferredConfirmation
-	if ch.confirming {
+	if ch.confirming.Load() {
 		dc = ch.confirms.publish()
 	}
 
@@ -1681,7 +1942,7 @@ func (ch *Channel) PublishWithDeferredConfirm(exchange, key string, mandatory, i
 			AppId:           msg.AppId,
 		},
 	}); err != nil {
-		if ch.confirming {
+		if ch.confirming.Load() {
 			ch.confirms.unpublish()
 		}
 		return nil, err
@@ -1852,9 +2113,7 @@ func (ch *Channel) Confirm(noWait bool) error {
 		return err
 	}
 
-	ch.confirmM.Lock()
-	ch.confirming = true
-	ch.confirmM.Unlock()
+	ch.confirming.Store(true)
 
 	return nil
 }
@@ -1947,47 +2206,75 @@ func (ch *Channel) GetNextPublishSeqNo() uint64 {
 	return ch.confirms.published + 1
 }
 
+// closeResources performs the final teardown of a Channel's consumers,
+// notify listeners, and confirms, then transitions the lifecycle to
+// StateClosed with the given (already-wrapped) error. Shared by shutdown()
+// and cleanup(), both of which can independently decide to invoke it for the
+// same Channel — ch.closeOnce ensures the teardown itself, and the resulting
+// state transition, happens exactly once no matter which caller gets here
+// first. Callers must hold ch.m and ch.notifyM.
+func (ch *Channel) closeResources(err error) {
+	ch.closeOnce.Do(func() {
+		ch.consumers.close()
+
+		for _, c := range ch.closes {
+			close(c)
+		}
+
+		for _, c := range ch.flows {
+			close(c)
+		}
+
+		for _, c := range ch.returns {
+			close(c)
+		}
+
+		for _, c := range ch.cancels {
+			close(c)
+		}
+
+		for _, c := range ch.recoveryCancels {
+			close(c)
+		}
+
+		// Set the slices to nil to prevent the dispatch() range from sending on
+		// the now closed channels after we release the notifyM mutex
+		ch.recoveryCancels = nil
+		ch.flows = nil
+		ch.closes = nil
+		ch.returns = nil
+		ch.cancels = nil
+
+		if ch.confirms != nil {
+			ch.confirms.Close()
+		}
+
+		ch.noNotify = true
+
+		ch.lifeCycle.SetState(StateClosed, err)
+	})
+}
+
 // cleanup closes all the channels and the confirms.
-func (ch *Channel) cleanup() {
+func (ch *Channel) cleanup(e error) {
+	ch.setClosed() // Ensure ch.IsClosed() returns true globally
+
+	ch.destructorM.Lock()
+	ch.destructed = true // Lock out any future transport shutdowns as well
+	ch.destructorM.Unlock()
+
 	ch.m.Lock()
 	defer ch.m.Unlock()
 
 	ch.notifyM.Lock()
 	defer ch.notifyM.Unlock()
 
-	ch.consumers.close()
-
-	for _, c := range ch.closes {
-		close(c)
+	var err error
+	if e != nil {
+		err = fmt.Errorf("channel cleanup error: %w", e)
 	}
 
-	for _, c := range ch.flows {
-		close(c)
-	}
-
-	for _, c := range ch.returns {
-		close(c)
-	}
-
-	for _, c := range ch.cancels {
-		close(c)
-	}
-
-	for _, c := range ch.recoveryCancels {
-		close(c)
-	}
-
-	ch.recoveryCancels = nil
-	ch.flows = nil
-	ch.closes = nil
-	ch.returns = nil
-	ch.cancels = nil
-
-	if ch.confirms != nil {
-		ch.confirms.Close()
-	}
-
-	ch.noNotify = true
+	ch.closeResources(err)
 }
 
 // watchChannel watches the channel for close events and triggers recovery if needed.
@@ -1997,7 +2284,7 @@ func (ch *Channel) watchChannel() {
 		for err := range errCh {
 			if err != nil {
 				Logger.Printf("Channel %d closed unexpectedly: %v", ch.id, err)
-				if ch.connection.Config.Recovery != nil && ch.connection.Config.Recovery.ConnectionRecovery != nil {
+				if ch.connection.IsConnectionRecoveryEnabled() {
 					ch.connection.Config.Recovery.ConnectionRecovery.OnChannelClose(ch, err)
 				}
 			}
@@ -2009,12 +2296,128 @@ func (ch *Channel) watchChannel() {
 // re-opens the AMQP channel with the same channel id and configuration,
 // and re-establishes all active publisher confirmations and consumer subscriptions.
 func (ch *Channel) Reconnect() error {
+	if err := ch.reconnectChannel(); err != nil {
+		return err
+	}
+
+	// Recover topology for this channel
+	if ch.connection.IsTopologyRecoveryEnabled() {
+		skippedTopologyEntities, err := ch.connection.Config.Recovery.TopologyRecovery.RecoverTopology(ch.connection, []*Channel{ch})
+		if err != nil {
+			Logger.Printf("Channel %d recovery topology error: %v", ch.id, err)
+			return err
+		}
+		for _, e := range skippedTopologyEntities {
+			Logger.Printf("Channel %d topology recovery skipped entity: %v", ch.id, e)
+		}
+	}
+
+	return nil
+}
+
+// openChannelSession resets client-side state, opens a fresh broker channel,
+// and restores QoS/Confirm configuration. It is the shared single-attempt core
+// used by both reconnectChannel (retry loop) and reopenIfClosed (topology
+// recovery). The caller must hold ch.reconnecting and manage lifecycle transitions.
+//
+// openSucceeded is true when ch.open() completed — the caller needs this to decide
+// whether to send a channel.close courtesy frame to the broker before the next
+// retry (meaningful only when open succeeded but setup then failed).
+func (ch *Channel) openChannelSession() (openSucceeded bool, err error) {
+	// Close() may have marked closeInit and be racing us for ch.reconnecting;
+	// both callers hold that mutex, so this check is the single point that
+	// keeps either from resurrecting a channel Close() already committed to
+	// closing. See reconnectChannel() for the analogous per-caller check this
+	// supersedes.
+	if ch.closeInit.Load() {
+		return false, ErrClosed
+	}
+
+	// 1. Reset client-side state
+	ch.destructorM.Lock()
+	ch.m.Lock()
+	ch.resetState()
+	ch.m.Unlock()
+	ch.destructorM.Unlock()
+
+	// 2. Open a fresh channel on the broker
+	if err = ch.open(); err != nil {
+		return false, err
+	}
+
+	// 3. Perform QoS and Confirms setup.
+	return true, ch.setupChannelBasic()
+}
+
+// reopenIfClosed reopens a channel that was closed as a side-effect of a
+// broker soft error (e.g. PRECONDITION_FAILED / 406) during topology recovery.
+func (ch *Channel) reopenIfClosed() {
+	// Fast path: skip the mutex entirely for the common case where the channel
+	// is already open. Avoids blocking on ch.reconnecting for every entity in
+	// a healthy recovery where no reopen is needed.
+	if !ch.IsClosed() {
+		return
+	}
+
+	ch.reconnecting.Lock()
+	defer ch.reconnecting.Unlock()
+
+	// Re-check under lock: a concurrent watchChannel goroutine may have already
+	// reopened the channel via reconnectChannel between the fast-path check above
+	// and acquiring the lock.
+	if !ch.IsClosed() {
+		return
+	}
+
+	Logger.Printf("topology recovery: channel %d closed by broker soft error; reopening for remaining entities", ch.id)
+	ch.lifeCycle.SetState(StateReconnecting, nil)
+
+	// Make sure the channel id is registered before sending channel.open.
+	ch.connection.reregisterChannel(ch)
+
+	if opened, err := ch.openChannelSession(); err != nil {
+		Logger.Printf("topology recovery: failed to reopen channel %d: %v", ch.id, err)
+		if opened {
+			_ = ch.call(&channelClose{ReplyCode: replySuccess, ReplyText: "Topology recovery"}, &channelCloseOk{})
+		}
+		ch.setClosed()
+		return
+	}
+
+	ch.lifeCycle.SetState(StateOpen, nil)
+}
+
+// reconnectChannel opens a fresh channel on the broker and performs basic setup (QoS, Confirms).
+// It does NOT recover the channel's topology.
+//
+// Applications must coordinate with in-progress recovery rather than calling into the
+// Channel unconditionally: register NotifyStateChange and hold off on new operations on
+// this Channel until state is StateOpen again. In order to reopen the channel, IsClosed()
+// will momentarily return false before the channel.open handshake actually completes — a
+// call made on this Channel in that window, without waiting for StateOpen, can interleave a
+// frame with the handshake and cause the broker to reject it as a protocol violation.
+// Waiting for StateOpen via NotifyStateChange before issuing new calls avoids this entirely.
+func (ch *Channel) reconnectChannel() error {
 	if !ch.connection.IsRecoveryEnabled() {
 		return ErrClosed
 	}
 
 	ch.reconnecting.Lock()
 	defer ch.reconnecting.Unlock()
+
+	// Re-check: Close() may have marked closeInit and be racing us for
+	// ch.reconnecting between our check above and this point — in
+	// particular, its earlier closeRecovery() call runs before we've
+	// registered a cancel channel below, so that signal alone would
+	// otherwise be lost. This is a fast-path optimization on top of the
+	// authoritative check in openChannelSession(): without it, a
+	// reconnectChannel() that wins the race would still run its full retry
+	// loop (with backoff) before openChannelSession() rejects each attempt,
+	// instead of returning immediately. See Connection.Reconnect() for the
+	// analogous connection-level race.
+	if ch.closeInit.Load() {
+		return ErrClosed
+	}
 
 	if !ch.IsClosed() {
 		return nil
@@ -2024,7 +2427,10 @@ func (ch *Channel) Reconnect() error {
 
 	cancelCh := ch.NotifyRecoveryCancel(make(chan struct{}))
 
-	var err error
+	var (
+		err    error
+		opened bool
+	)
 	for i := 0; i < ch.connection.MaxRetryCount(); i++ {
 		// Exit early if Close() was already called
 		select {
@@ -2047,81 +2453,54 @@ func (ch *Channel) Reconnect() error {
 			}
 		}
 
-		// 1. Reset client-side state
-		// Reset state under locks to ensure atomicity and prevent data races.
-		// Acquiring destructorM -> m avoids any lock ordering deadlocks.
-		ch.destructorM.Lock()
-		ch.m.Lock()
-		ch.resetState()
-		ch.m.Unlock()
-		ch.destructorM.Unlock()
-
-		// 2. Open a fresh channel on the broker
-		if err = ch.open(); err != nil {
-			Logger.Printf("Channel %d recovery open error: %v", ch.id, err)
+		opened, err = ch.openChannelSession()
+		if err != nil {
+			Logger.Printf("Channel %d recovery attempt %d failed: %v", ch.id, i+1, err)
+			if opened {
+				// open() succeeded but setupChannelBasic() failed:
+				// gracefully close the broker-side session before the next attempt.
+				// channelClose must be sent before setClosed()
+				_ = ch.call(&channelClose{ReplyCode: replySuccess, ReplyText: "Recovery retry"}, &channelCloseOk{})
+			}
+			// resetState() in openChannelSession() already flipped ch.closed
+			// to false for this attempt; restore it here on any failure
+			// (including open() itself failing, opened == false) so a
+			// concurrently-blocked Close() doesn't mistake the dead channel
+			// for a live one once reconnectChannel() gives up.
+			ch.setClosed()
 			continue
 		}
 
-		// 3. Perform setup steps. If ANY step fails, we close the channel and retry.
-		if err = ch.setupChannel(); err != nil {
-			Logger.Printf("Channel %d setup failed: %v, closing and retrying...", ch.id, err)
-			ch.setClosed() // Marks closed locally
-			// Send channel.close to the broker so it knows this channel is defunct
-			_ = ch.call(&channelClose{ReplyCode: replySuccess, ReplyText: "Recovery retry"}, &channelCloseOk{})
-			continue
-		}
-
-		// If we reached here, recovery was 100% successful!
-		Logger.Printf("Channel %d recovery successful", ch.id)
+		// Channel session is successfully opened!
 		ch.lifeCycle.SetState(StateOpen, nil)
 		return nil
 	}
 
 	Logger.Printf("Channel %d recovery exhausted all %d retries", ch.id, ch.connection.MaxRetryCount())
 	ch.setClosed()
-	ch.lifeCycle.SetState(StateClosed, err)
 	return err
 }
 
-// setupChannel performs all channel-level setup steps sequentially.
-// If any of these fail, we return the error immediately so the reconnect loop can try a new channel.
-func (ch *Channel) setupChannel() error {
+func (ch *Channel) setupChannelBasic() error {
 	var err error
-	// TODO Re-enable QoS if it was tracked
+
+	// Reset QoS if it was configured
+	config := ch.connection.getTopologyConfiguration(ch.id, false)
+	if config.Qos != nil {
+		if err = ch.Qos(int(config.Qos.PrefetchCount), int(config.Qos.PrefetchSize), config.Qos.Global); err != nil {
+			Logger.Printf("Channel %d recovery QoS error: %v", ch.id, err)
+			return err
+		}
+	}
 
 	// Re-enable confirms if needed
-	if ch.confirming {
+	if ch.confirming.Load() {
 		if err = ch.Confirm(false); err != nil {
 			Logger.Printf("Channel %d recovery Confirm error: %v", ch.id, err)
 			return err
 		}
 	}
 
-	// TODO Recover Topology (Exchanges, Queues, Bindings) here
-
-	// Re-subscribe consumers
-	ch.consumers.Lock()
-	configs := make(map[string]consumerConfig, len(ch.consumers.configs))
-	for tag, config := range ch.consumers.configs {
-		configs[tag] = config
-	}
-	ch.consumers.Unlock()
-	for tag, config := range configs {
-		req := &basicConsume{
-			Queue:       config.Queue,
-			ConsumerTag: tag,
-			NoLocal:     config.NoLocal,
-			NoAck:       config.AutoAck,
-			Exclusive:   config.Exclusive,
-			NoWait:      config.NoWait,
-			Arguments:   config.Args,
-		}
-		res := &basicConsumeOk{}
-		if err = ch.call(req, res); err != nil {
-			Logger.Printf("Channel %d recovery consume error for tag %s: %v", ch.id, tag, err)
-			return err
-		}
-	}
 	return nil
 }
 
@@ -2139,4 +2518,18 @@ func (ch *Channel) resetState() {
 	if ch.confirms != nil {
 		ch.confirms.reset()
 	}
+}
+
+// TopologyConfiguration returns a cloned, read-only snapshot of topology tracked for recovery.
+// When global is false, only entities declared on this channel are returned.
+// When global is true, entities from all channels on the connection are merged into a single
+// view — because AMQP topology (exchanges, queues, bindings) is scoped to the TCP connection,
+// the merged view reflects the complete set of entities that must be recovered after a reconnect.
+// QoS settings are channel-scoped and always reflect only this channel's configuration.
+// Modifying the returned value does not affect the channel's internal state.
+func (ch *Channel) TopologyConfiguration(global bool) TopologyConfiguration {
+	if ch.connection == nil {
+		return *newTopologyConfiguration()
+	}
+	return ch.connection.getTopologyConfiguration(ch.id, global)
 }

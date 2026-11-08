@@ -40,6 +40,9 @@ All core code is in the root package (excluding examples under `_examples/` and 
 Caller
   └─ Connection (connection.go)     TCP socket, AMQP handshake, heartbeat, frame mux
        ├─ read.go / write.go        frame (de)serialization
+       ├─ recovery.go               connection/channel recovery (reconnection)
+       ├─ lifecycle.go              StateOpen/Reconnecting/Closing/Closed FSM + NotifyStateChange fan-out
+       ├─ log.go                    package-level Logger (SetLogger), no-op by default
        └─ Channel (channel.go)      AMQP channel — all protocol methods
             ├─ confirms.go          publisher confirm tracking
             └─ consumers.go         consumer tag → delivery channel dispatch
@@ -82,20 +85,33 @@ Body can span multiple `frameBody` frames; `Channel` accumulates them before dis
 
 ### Notify channels
 
-All `Notify*` methods (`NotifyClose`, `NotifyBlocked`, `NotifyFlow`, `NotifyReturn`, `NotifyCancel`, `NotifyConfirm`, `NotifyPublish`) follow the same contract:
+All `Notify*` methods (`NotifyClose`, `NotifyBlocked`, `NotifyFlow`, `NotifyReturn`, `NotifyCancel`, `NotifyConfirm`, `NotifyPublish`, `NotifyStateChange`, `NotifyRecoveryCancel`) follow the same contract:
 
 - The caller provides a channel (buffered recommended).
-- The library writes to it and **closes it** when the entity shuts down.
-- Multiple registrations result in a broadcast — all listeners receive every event.
-- Reading from a closed listener channel signals shutdown.
+- The library writes to it (or closes it for signal-only notifications) and **closes it** when the entity shuts down, is closed, or the event occurs.
+- Multiple registrations result in a broadcast — all listeners receive every event or signal.
+- Reading from a closed listener channel signals shutdown or cancellation.
 
-### No automatic reconnection
+### Connection Recovery / Reconnection
 
-By design, the library does **not** reconnect automatically. Applications detect closure via `NotifyClose` and re-establish connections and declare topology themselves. The `_examples/client/client.go` demonstrates a reconnecting wrapper pattern.
+The library supports automatic connection and channel recovery (reconnection) when a network failure occurs.
+
+- **Enabling Recovery**: Automatic recovery is enabled by providing a non-nil `Recovery` configuration in `Config` when calling `DialConfig`. If `Recovery` is nil (the default), automatic recovery is disabled.
+- **Configuration**: `Config.Recovery` (`recovery.go`) contains `ReconnectionConfig` (`MaxRetryCount`, `RetryInterval`), `ConnectionRecovery` (interface with `OnConnectionClose`/`OnChannelClose` hooks), and `TopologyRecovery` (interface with `RecoverTopology`). If these are nil but `Recovery` is non-nil, `DefaultReconnectionConfig`, `DefaultConnectionRecovery`, and `DefaultTopologyRecovery` are used. Whether a given close is retried at all is decided per-error by `Error.Recoverable()` (based on the AMQP reply code via `isSoftExceptionCode`), not by a config field.
+- **Topology recovery scope**: `Recovery.TopologyRecoveryMode` selects `TopologyRecoveryAllEnabled` (default), `TopologyRecoveryOnlyTransient` (only exclusive/auto-delete queues, auto-delete exchanges, their bindings, and consumers — durable topology is assumed broker-retained), or `TopologyRecoveryDisabled`. `Recovery.OnTopologyEntityError` is called per failed entity (exchange/queue/binding/consumer) during recovery; returning `true` (or leaving it nil) skips that entity and continues, `false` aborts and retries the whole reconnect cycle. Skipped entities surface in `StateChanged.SkippedTopologyEntities` on the `StateReconnecting`→`StateOpen` transition.
+- **State Monitoring**: Applications can monitor recovery state transitions (`StateOpen`/`StateReconnecting`/`StateClosing`/`StateClosed`, defined in `lifecycle.go`) by registering with `Connection.NotifyStateChange` or `Channel.NotifyStateChange`. Each registered listener gets its own delivery goroutine with strict FIFO ordering and a bounded (50-entry sliding window) queue, so a slow listener can't block others or the state machine itself.
+- **Cancellation**: Recovery can be canceled or aborted (e.g., when `Close()` is called during active reconnection). Applications can listen to this via `Connection.NotifyRecoveryCancel` or `Channel.NotifyRecoveryCancel`.
+- **Examples**: `_examples/recovery/recovery.go` demonstrates the automatic recovery pattern, while `_examples/client/client.go` demonstrates a manual reconnecting wrapper pattern.
 
 ## Key conventions
 
 - `*Error` (`types.go`) carries an AMQP reply code and whether the error is recoverable. Server-initiated closes arrive on `NotifyClose` channels as `*Error`.
 - `Table` is `map[string]interface{}` with a restricted set of allowed value types enumerated in `types.go`.
-- Mutexes follow a strict order: `Connection.m` → `Channel.m` (never the reverse) to avoid deadlock.
+- Mutexes follow a strict order: `Connection.m` → `Channel.m` (never the reverse) to avoid deadlock. Within `Connection` itself, teardown acquires `destructorM` → `closeM` → `m` in that order (see `connection.go`); `topologyM` is acquired independently and must not be held while calling back into code that re-enters `record*`/`remove*` topology methods.
 - `atomic.Bool` flags (`Connection.closed`, `Channel.closed`) allow lock-free early-exit checks on the hot path.
+
+## Comments
+- Raise the bar very high for new comments: only add very important comments, both in tests and in the implementation
+- Keep comments concise and to the point
+- Add comments above the line they are referring to, not at the end of the line (an example of what's not to do: 1 + 1. %% equals 2)
+- Make sure to use proper English grammar, in particular articles, punctuation and full stops at the end of sentences except for Markdown list items

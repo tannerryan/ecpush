@@ -15,6 +15,14 @@ Please visit the corresponding
 [**GoDoc**](https://pkg.go.dev/github.com/tannerryan/ecpush) entry for all
 necessary documentation, including parameter definitions and program defaults.
 
+With `FetchContent` enabled, downloads and redirects are restricted to HTTPS on
+`weather.gc.ca`, `meteo.gc.ca`, and their subdomains. Legacy HTTP product URLs
+are upgraded to HTTPS. Decoded content is limited to 32 MiB per product;
+rejected downloads set `ContentFailure`. For larger products, leave
+`FetchContent` disabled and download `Event.URL` with your own size policy.
+Events are acknowledged when handed to `Consume`, before the caller finishes
+processing them.
+
 ## Goals
 
 The main goal of ecpush is to provide a simple and lightweight client that can
@@ -33,8 +41,9 @@ To create a new client, create a `Client` struct. The only required field is the
 definition. An example configuration is shown below (subscribing text bulletins
 and citypage XML files).
 
-Please see [MSC Datamart documentation](https://eccc-msc.github.io/open-data/msc-datamart/readme_en/)
-for formatting subtopics.
+Please see [MSC Datamart
+documentation](https://eccc-msc.github.io/open-data/msc-datamart/readme_en/) for
+formatting subtopics.
 
 ```go
 client := &ecpush.Client{

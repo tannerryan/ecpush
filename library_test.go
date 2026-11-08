@@ -9,8 +9,9 @@ import (
 	"crypto/sha512"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
-	"net/http/httptest"
+	"strings"
 	"testing"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -106,18 +107,21 @@ func TestParseDelivery(t *testing.T) {
 
 func TestFetchEvent(t *testing.T) {
 	const payload = "hello world"
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	useHTTPTransport(t, func(r *http.Request) (*http.Response, error) {
+		if err := r.Context().Err(); err != nil {
+			return nil, err
+		}
+		status := http.StatusOK
 		switch r.URL.Path {
 		case "/notfound":
-			w.WriteHeader(http.StatusNotFound)
-		default:
-			fmt.Fprint(w, payload)
+			status = http.StatusNotFound
 		}
-	}))
-	defer srv.Close()
+		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(payload)), Header: make(http.Header)}, nil
+	})
+	const baseURL = "https://dd.weather.gc.ca"
 
 	t.Run("valid md5", func(t *testing.T) {
-		event := &Event{URL: srv.URL + "/ok", MD5: fmt.Sprintf("%x", md5.Sum([]byte(payload)))}
+		event := &Event{URL: baseURL + "/ok", MD5: fmt.Sprintf("%x", md5.Sum([]byte(payload)))}
 		body, err := fetchEvent(context.Background(), event)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -128,14 +132,14 @@ func TestFetchEvent(t *testing.T) {
 	})
 
 	t.Run("bad checksum", func(t *testing.T) {
-		event := &Event{URL: srv.URL + "/ok", SHA512: "deadbeef"}
+		event := &Event{URL: baseURL + "/ok", SHA512: "deadbeef"}
 		if _, err := fetchEvent(context.Background(), event); !errors.Is(err, errBadHash) {
 			t.Fatalf("err = %v, want errBadHash", err)
 		}
 	})
 
 	t.Run("non-200 status", func(t *testing.T) {
-		event := &Event{URL: srv.URL + "/notfound"}
+		event := &Event{URL: baseURL + "/notfound"}
 		if _, err := fetchEvent(context.Background(), event); !errors.Is(err, errFailedFetch) {
 			t.Fatalf("err = %v, want errFailedFetch", err)
 		}
@@ -144,11 +148,171 @@ func TestFetchEvent(t *testing.T) {
 	t.Run("cancelled context", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		event := &Event{URL: srv.URL + "/ok"}
+		event := &Event{URL: baseURL + "/ok"}
 		if _, err := fetchEvent(ctx, event); err == nil {
 			t.Fatal("expected error for cancelled context")
 		}
 	})
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+// Keep the real redirect policy while replacing all network access.
+func useHTTPTransport(t *testing.T, transport roundTripFunc) {
+	t.Helper()
+	old := httpClient
+	client := *old
+	client.Transport = transport
+	httpClient = &client
+	t.Cleanup(func() { httpClient = old })
+}
+
+func TestFetchDestinations(t *testing.T) {
+	for _, tt := range []struct {
+		url     string
+		allowed bool
+	}{
+		{"https://dd.weather.gc.ca/product", true},
+		{"https://dd.weather.gc.ca:443/product", true},
+		{"https://weather.gc.ca/product", true},
+		{"https://dd1.weather.gc.ca/product", true},
+		{"https://dd2.weather.gc.ca/product", true},
+		{"https://another.weather.gc.ca/product", true},
+		{"https://DD3.WEATHER.GC.CA/product", true},
+		{"https://meteo.gc.ca/product", true},
+		{"https://dd.meteo.gc.ca/product", true},
+		{"https://DD3.METEO.GC.CA/product", true},
+		{"http://dd.weather.gc.ca/product", true},
+		{"http://dd.weather.gc.ca:80/product", true},
+		{"http://dd4.weather.gc.ca:80/product", true},
+		{"http://dd.meteo.gc.ca/product", true},
+		{"http://dd4.meteo.gc.ca:80/product", true},
+		{"https://example.com/product", false},
+		{"https://dd.weather.gc.ca.example.com/product", false},
+		{"https://fakeweather.gc.ca/product", false},
+		{"https://fakemeteo.gc.ca/product", false},
+		{"https://dd.meteo.gc.ca.example.com/product", false},
+		{"http://127.0.0.1/product", false},
+		{"https://dd.weather.gc.ca:8443/product", false},
+		{"https://dd.meteo.gc.ca:8443/product", false},
+		{"https://user:pass@dd.weather.gc.ca/product", false},
+		{"file:///product", false},
+	} {
+		t.Run(tt.url, func(t *testing.T) {
+			calls := 0
+			useHTTPTransport(t, func(req *http.Request) (*http.Response, error) {
+				calls++
+				if req.URL.Scheme != "https" {
+					t.Fatalf("unexpected destination: %s", req.URL)
+				}
+				if req.Host != req.URL.Host {
+					t.Fatalf("Host = %q, want %q", req.Host, req.URL.Host)
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+			})
+			_, err := fetchEvent(context.Background(), &Event{URL: tt.url})
+			if tt.allowed {
+				if err != nil || calls != 1 {
+					t.Fatalf("err = %v, requests = %d", err, calls)
+				}
+			} else if !errors.Is(err, errContentURL) || calls != 0 {
+				t.Fatalf("err = %v, requests = %d; want rejected without a request", err, calls)
+			}
+		})
+	}
+}
+
+func TestFetchRedirects(t *testing.T) {
+	for _, tt := range []struct {
+		target  string
+		allowed bool
+	}{
+		{"/next", true},
+		{"https://another.weather.gc.ca/next", true},
+		{"https://meteo.gc.ca/next", true},
+		{"https://dd.meteo.gc.ca/next", true},
+		{"https://example.com/next", false},
+		{"https://fakemeteo.gc.ca/next", false},
+		{"https://dd.meteo.gc.ca.example.com/next", false},
+		{"http://dd.weather.gc.ca/next", false},
+		{"http://dd.meteo.gc.ca/next", false},
+		{"https://dd.weather.gc.ca:8443/next", false},
+		{"https://user:pass@dd.weather.gc.ca/next", false},
+	} {
+		t.Run(tt.target, func(t *testing.T) {
+			calls := 0
+			useHTTPTransport(t, func(req *http.Request) (*http.Response, error) {
+				calls++
+				if req.URL.Path == "/start" {
+					return &http.Response{StatusCode: http.StatusFound, Header: http.Header{"Location": {tt.target}}, Body: http.NoBody}, nil
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+			})
+			_, err := fetchEvent(context.Background(), &Event{URL: "https://dd.weather.gc.ca/start"})
+			if tt.allowed {
+				if err != nil || calls != 2 {
+					t.Fatalf("err = %v, requests = %d", err, calls)
+				}
+			} else if !errors.Is(err, errContentURL) || calls != 1 {
+				t.Fatalf("err = %v, requests = %d; want redirect rejected without retry", err, calls)
+			}
+		})
+	}
+}
+
+type sizedBody struct {
+	remaining int64
+	read      int64
+	closed    bool
+}
+
+func (b *sizedBody) Read(p []byte) (int, error) {
+	if b.remaining == 0 {
+		return 0, io.EOF
+	}
+	n := int(min(int64(len(p)), b.remaining))
+	clear(p[:n])
+	b.remaining -= int64(n)
+	b.read += int64(n)
+	return n, nil
+}
+
+func (b *sizedBody) Close() error { b.closed = true; return nil }
+
+func TestFetchContentLimit(t *testing.T) {
+	for _, tt := range []struct {
+		name                   string
+		size, length, wantRead int64
+		tooLarge               bool
+	}{
+		{"declared too large", maxContentSize + 1, maxContentSize + 1, 0, true},
+		{"unknown length too large", maxContentSize + 1024, -1, maxContentSize + 1, true},
+		{"exact limit", maxContentSize, -1, maxContentSize, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			body := &sizedBody{remaining: tt.size}
+			calls := 0
+			useHTTPTransport(t, func(req *http.Request) (*http.Response, error) {
+				calls++
+				return &http.Response{StatusCode: http.StatusOK, Body: body, ContentLength: tt.length}, nil
+			})
+			content, err := fetchEvent(context.Background(), &Event{URL: "https://dd.weather.gc.ca/product"})
+			if tt.tooLarge {
+				if !errors.Is(err, errContentTooLarge) || content != nil {
+					t.Fatalf("got %d bytes, err = %v; want oversized response rejected", len(content), err)
+				}
+			} else if err != nil || len(content) != maxContentSize {
+				t.Fatalf("got %d bytes, err = %v", len(content), err)
+			}
+			if calls != 1 || body.read != tt.wantRead || !body.closed {
+				t.Fatalf("requests = %d, bytes read = %d, closed = %v", calls, body.read, body.closed)
+			}
+		})
+	}
 }
 
 func TestConnectNoSubtopics(t *testing.T) {

@@ -37,6 +37,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -59,6 +60,7 @@ const (
 	maxRecoverDelay = 16 * time.Second   // reconnection + malformed message max recovery delay
 	contentAttempts = 3                  // number of HTTP content fetch attempts
 	httpTimeout     = 10 * time.Second   // http fetch timeout
+	maxContentSize  = 32 << 20           // maximum decoded HTTP content size
 	httpUserAgent   = "Mozilla/5.0 (compatible; Go-http-client/1.1; +https://github.com/tannerryan/ecpush)"
 )
 
@@ -66,6 +68,12 @@ var (
 	// httpClient for fetching content
 	httpClient = &http.Client{
 		Timeout: httpTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("ecpush: too many redirects")
+			}
+			return validateContentURL(req.URL)
+		},
 		Transport: &http.Transport{
 			DisableKeepAlives: true,
 		},
@@ -84,7 +92,9 @@ var (
 	// checksum
 	errBadHash = errors.New("ecpush: provided hash does not match received content")
 	// errFailedFetch returned when client fails to fetch HTTP content
-	errFailedFetch = errors.New("ecpush: failed to fetch content")
+	errFailedFetch     = errors.New("ecpush: failed to fetch content")
+	errContentURL      = errors.New("ecpush: content URL must use HTTPS on weather.gc.ca, meteo.gc.ca, or their subdomains")
+	errContentTooLarge = errors.New("ecpush: content exceeds 32 MiB")
 )
 
 // Client contains the ecpush consumer client.
@@ -100,9 +110,8 @@ type Client struct {
 	delay     *backoff.ExponentialBackOff // delay is exponential backoff for connection recovery
 	closeOnce sync.Once                   // closeOnce ensures the client is torn down exactly once
 
-	mu   sync.Mutex       // mu guards conn and ch
+	mu   sync.Mutex       // mu guards conn
 	conn *amqp.Connection // conn is the active amqp.Connection
-	ch   *amqp.Channel    // ch is the active amqp.Channel
 }
 
 // Event is a received payload from Environment Canada's datamart.
@@ -188,6 +197,8 @@ func (c *Client) Consume() (*Event, bool) {
 // failure, backing off between attempts. It closes ready after the first
 // successful provision and returns only on context cancellation.
 func (c *Client) run(ready chan<- struct{}) {
+	defer c.activated.Store(false)
+	defer c.cleanup()
 	var signalOnce sync.Once
 
 	for {
@@ -205,6 +216,10 @@ func (c *Client) run(ready chan<- struct{}) {
 			continue
 		}
 
+		if c.ctx.Err() != nil {
+			return
+		}
+
 		// provisioned successfully
 		c.activated.Store(true)
 		c.delay.Reset()
@@ -215,12 +230,8 @@ func (c *Client) run(ready chan<- struct{}) {
 		select {
 		case <-c.ctx.Done():
 			return
-		case amqpErr := <-notify:
-			if amqpErr != nil {
-				c.log("[ecpush] disconnected from " + broker + ": " + amqpErr.Error())
-			} else {
-				c.log("[ecpush] disconnected from " + broker)
-			}
+		case <-notify:
+			c.log("[ecpush] consumer stopped, reconnecting to " + broker)
 			c.cleanup()
 			if !c.sleep() {
 				return
@@ -230,28 +241,33 @@ func (c *Client) run(ready chan<- struct{}) {
 }
 
 // provision dials the broker, declares the queue/QoS/bindings, and starts the
-// consumer goroutine. On success it returns a channel notified on connection
-// close; otherwise it returns an error.
-func (c *Client) provision() (chan *amqp.Error, error) {
+// consumer goroutine. On success it returns a channel closed when consumption
+// ends, including connection closure, channel closure, and broker cancellation.
+func (c *Client) provision() (<-chan struct{}, error) {
 	// establish connection with remote server
 	uri := fmt.Sprintf("amqps://%s:%s@%s:%d/", user, pass, broker, port)
 	conn, err := amqp.DialTLS(uri, tlsConfig)
 	if err != nil {
 		return nil, fmt.Errorf("[ecpush] failed to connect to %s: %w", broker, err)
 	}
+	// Publish the connection before channel setup so cancellation can interrupt
+	// provisioning. Never publish a connection after shutdown has already run.
+	c.mu.Lock()
+	if err := c.ctx.Err(); err != nil {
+		c.mu.Unlock()
+		conn.CloseDeadline(time.Now())
+		return nil, err
+	}
+	c.conn = conn
+	c.mu.Unlock()
 	c.log("[ecpush] connected to " + broker)
 
 	// establish consumption channel
 	ch, err := conn.Channel()
 	if err != nil {
-		conn.Close()
 		return nil, fmt.Errorf("[ecpush] failed to declare channel: %w", err)
 	}
 	c.log("[ecpush] declared channel")
-
-	c.mu.Lock()
-	c.conn, c.ch = conn, ch
-	c.mu.Unlock()
 
 	// declare queue
 	q, err := ch.QueueDeclare(
@@ -308,10 +324,12 @@ func (c *Client) provision() (chan *amqp.Error, error) {
 	}
 
 	c.log("[ecpush] client provisioned, activating consumer")
-	go c.consume(messages)
-
-	// notify on connection close so the run loop can recover
-	return conn.NotifyClose(make(chan *amqp.Error, 1)), nil
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.consume(messages)
+	}()
+	return done, nil
 }
 
 // consume reads raw deliveries, transforms them into Events, and emits them on
@@ -393,15 +411,14 @@ func (c *Client) sleep() bool {
 // call multiple times.
 func (c *Client) cleanup() {
 	c.mu.Lock()
-	ch, conn := c.ch, c.conn
-	c.ch, c.conn = nil, nil
+	conn := c.conn
+	c.conn = nil
 	c.mu.Unlock()
 
-	if ch != nil {
-		ch.Close()
-	}
 	if conn != nil {
-		conn.Close()
+		// Closing the connection closes its channels too. Bound the graceful
+		// shutdown so an unresponsive broker cannot hold cancellation open.
+		conn.CloseDeadline(time.Now().Add(time.Second))
 	}
 }
 
@@ -410,22 +427,7 @@ func (c *Client) cleanup() {
 func (c *Client) close() {
 	c.closeOnce.Do(func() {
 		c.log("[ecpush] received context cancellation, terminating consumer")
-		c.activated.Store(false)
-
-		c.mu.Lock()
-		ch, conn := c.ch, c.conn
-		c.ch, c.conn = nil, nil
-		c.mu.Unlock()
-
-		// cancel and close channel
-		if ch != nil {
-			ch.Cancel(c.uid, true)
-			ch.Close()
-		}
-		// close connection
-		if conn != nil {
-			conn.Close()
-		}
+		c.cleanup()
 	})
 }
 
@@ -454,6 +456,9 @@ func fetchEvent(ctx context.Context, event *Event) ([]byte, error) {
 			return body, nil
 		}
 		lastErr = err
+		if errors.Is(err, errContentURL) || errors.Is(err, errContentTooLarge) {
+			break
+		}
 		// abort early if the context has been cancelled
 		if ctx.Err() != nil {
 			break
@@ -465,11 +470,42 @@ func fetchEvent(ctx context.Context, event *Event) ([]byte, error) {
 	return nil, lastErr
 }
 
+func isContentHost(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	for _, domain := range []string{"weather.gc.ca", "meteo.gc.ca"} {
+		if host == domain || strings.HasSuffix(host, "."+domain) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateContentURL restricts requests and redirects to Datamart's domains.
+func validateContentURL(u *url.URL) error {
+	if u.Scheme != "https" || u.User != nil ||
+		!isContentHost(u.Hostname()) ||
+		(u.Port() != "" && u.Port() != "443") {
+		return errContentURL
+	}
+	return nil
+}
+
 // fetchOnce performs a single HTTP fetch of an Event and validates the content
 // checksum, if one was provided.
 func fetchOnce(ctx context.Context, event *Event) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, event.URL, nil)
 	if err != nil {
+		return nil, err
+	}
+	// Older notifications use HTTP URLs; fetch the same trusted origin over
+	// TLS.
+	if req.URL.Scheme == "http" && isContentHost(req.URL.Hostname()) &&
+		(req.URL.Port() == "" || req.URL.Port() == "80") {
+		req.URL.Scheme = "https"
+		req.URL.Host = req.URL.Hostname()
+		req.Host = req.URL.Host
+	}
+	if err := validateContentURL(req.URL); err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", httpUserAgent)
@@ -484,10 +520,16 @@ func fetchOnce(ctx context.Context, event *Event) ([]byte, error) {
 		return nil, fmt.Errorf("%w: unexpected status %s", errFailedFetch, resp.Status)
 	}
 
-	// read body
-	body, err := io.ReadAll(resp.Body)
+	if resp.ContentLength > maxContentSize {
+		return nil, errContentTooLarge
+	}
+	// Limit the decoded stream too, including gzip and unknown-length bodies.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxContentSize+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(body) > maxContentSize {
+		return nil, errContentTooLarge
 	}
 
 	// validate checksum
